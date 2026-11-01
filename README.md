@@ -22,7 +22,7 @@ recovery agent, a battery floor).
 Needs only the Xcode Command Line Tools (`xcode-select --install`).
 
 ```bash
-git clone https://github.com/professer-create/insomnia-mac.git
+git clone https://github.com/usmaniqbalkhan/insomnia-mac.git
 cd insomnia-mac
 ./install.sh
 ```
