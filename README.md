@@ -79,3 +79,7 @@ admin user.
 - On battery, the session ends automatically at 10% (`INSOMNIA_BATTERY_FLOOR` changes it).
 - A timed session ends on time even if the menu bar app is not running.
 - `./uninstall.sh` removes everything and prints the one `sudo rm` for the sudoers file.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
