@@ -173,12 +173,33 @@ What follows from that:
 ```bash
 PLAYWRIGHT_CORE=/path/to/node_modules/playwright-core tests/e2e-secure.sh   # locks the screen for ~4 minutes
 tests/lock-check.sh                                                         # locks the screen for ~15 seconds
+PLAYWRIGHT_CORE=/path/to/node_modules/playwright-core tests/lid-closed-test.sh # start it, then close the lid for a few minutes
 ```
 
 `e2e-secure.sh` covers: automation with the display on, turning the mode on
 mid-run, automation with the display off, staying awake, input not exposing
 the desktop, four concurrent jobs, auto-release, battery and thermal readings,
 a failing job, a monitor killed with SIGKILL, and the hardware check.
+
+### Lid closed
+
+`tests/lid-closed-test.sh` with the keep-awake session on, lid closed for 414 s
+on battery over a phone hotspot (same Mac, 2026-11-16):
+
+| | Lid open | Lid closed |
+|---|---|---|
+| Plain flags: cycles ok | 12 / 12 | 151 / 151 |
+| Anti-throttling flags: cycles ok | 12 / 12 | 150 / 150 |
+| Median cycle (plain / anti-throttling) | 1814 / 1822 ms | 1776 / 1780 ms |
+| Page visibility, rAF per cycle | visible, 99 | visible, 100 |
+| Router and internet ping | ok | 63 / 63 samples |
+| Wi-Fi link, IP address | active | active 63 / 63, unchanged |
+| Sleep entries in the power log | 0 | 0 |
+| Screen locked | no | 63 / 63 samples |
+
+With the session on, a closed lid changes nothing for a headed Chrome driven
+over CDP: same speed, pages stay `visible`, the network stays up, and the
+screen is locked the whole time.
 
 ## Safety
 
