@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>app frame</title>
+<body style="font-family:system-ui;margin:8px">
+<textarea id="prompts" rows="4" cols="60" placeholder="one prompt per line"></textarea><br>
+<select id="aspectRatio"><option>1:1</option><option>16:9</option></select>
+<button id="generate-btn">Generate</button>
+<div id="status">idle</div>
+<div id="out"></div>
+<script>
+// Counters the test reads to see whether timers and frame rendering keep running.
+window.__ticks = 0; window.__raf = 0;
+setInterval(() => { window.__ticks++; }, 100);
+(function loop() { window.__raf++; requestAnimationFrame(loop); })();
+
+// Each prompt becomes an image after a random delay, like a slow image API.
+document.getElementById('generate-btn').addEventListener('click', () => {
+  const lines = document.getElementById('prompts').value.split('\n').map(s => s.trim()).filter(Boolean);
+  const out = document.getElementById('out'); out.innerHTML = '';
+  document.getElementById('status').textContent = 'generating ' + lines.length;
+  let done = 0;
+  lines.forEach((text, i) => {
+    setTimeout(() => {
+      const c = document.createElement('canvas'); c.width = 256; c.height = 144;
+      const g = c.getContext('2d');
+      g.fillStyle = 'hsl(' + (i * 47 % 360) + ',60%,45%)'; g.fillRect(0, 0, 256, 144);
+      g.fillStyle = '#fff'; g.font = '16px system-ui'; g.fillText(text.slice(0, 26), 10, 76);
+      const img = new Image(); img.dataset.prompt = text; img.src = c.toDataURL('image/jpeg', 0.8);
+      out.appendChild(img);
+      if (++done === lines.length) document.getElementById('status').textContent = 'done ' + done;
+    }, 200 + Math.random() * 1000);
+  });
+});
+</script>
+</body>

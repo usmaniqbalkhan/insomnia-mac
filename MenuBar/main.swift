@@ -16,6 +16,8 @@ let bundleID = "com.usman.insomnia"
 let stateFile = NSString(string: "~/Library/Application Support/Insomnia/session").expandingTildeInPath
 let logFile = NSString(string: "~/Library/Logs/Insomnia/insomnia.log").expandingTildeInPath
 let lockOnLidCloseKey = "lockOnLidClose"
+let secureFile = NSString(string: "~/Library/Application Support/Insomnia/secure").expandingTildeInPath
+let secureLogFile = NSString(string: "~/Library/Logs/Insomnia/secure.log").expandingTildeInPath
 
 struct CommandResult {
     let status: Int32
@@ -173,6 +175,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let endLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let toggleItem = NSMenuItem(title: "Keep Awake With Lid Closed", action: #selector(toggle), keyEquivalent: "")
     private let lockOnLidItem = NSMenuItem(title: "Lock Screen When Lid Closes", action: #selector(toggleLockOnLidClose), keyEquivalent: "")
+    private let secureToggleItem = NSMenuItem(title: "Start Secure Background Mode", action: #selector(toggleSecure), keyEquivalent: "")
+    private let securePanel = SecurePanel()
     private let formatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "EEE d MMM, HH:mm"
@@ -228,6 +232,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(lockNowItem)
         menu.addItem(.separator())
 
+        secureToggleItem.target = self
+        menu.addItem(secureToggleItem)
+        let securePanelItem = NSMenuItem(title: "Secure Background Mode…", action: #selector(openSecurePanel), keyEquivalent: "s")
+        securePanelItem.target = self
+        menu.addItem(securePanelItem)
+        menu.addItem(.separator())
+
         let logItem = NSMenuItem(title: "Open Log", action: #selector(openLog), keyEquivalent: "")
         logItem.target = self
         menu.addItem(logItem)
@@ -250,6 +261,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 appendLog("lock on lid close is off, not locking")
             }
         }
+        // `insomnia panel` asks the running app to show the control panel.
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(openSecurePanel),
+            name: Notification.Name("com.usman.insomnia.showPanel"), object: nil)
         let sources = lidWatcher.start()
         appendLog("started, lid watcher: notifications \(sources.notifications ? "on" : "FAILED"), polling \(sources.polling ? "on" : "FAILED")")
     }
@@ -260,8 +275,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func refresh() {
         let on = sleepDisabled()
-        let symbol = on ? "eye.fill" : "eye.slash"
-        let description = on ? "Insomnia: awake with lid closed" : "Insomnia: normal sleep"
+        let secure = FileManager.default.fileExists(atPath: secureFile)
+        secureToggleItem.title = secure ? "Stop Secure Background Mode" : "Start Secure Background Mode (Locks Now)"
+        let symbol = secure ? "lock.shield.fill" : (on ? "eye.fill" : "eye.slash")
+        let description = secure ? "Insomnia: Secure Background Mode" : (on ? "Insomnia: awake with lid closed" : "Insomnia: normal sleep")
         if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: description) {
             image.isTemplate = true
             statusItem.button?.image = image
@@ -339,6 +356,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lockScreen()
     }
 
+    @objc func toggleSecure() {
+        runCLI(FileManager.default.fileExists(atPath: secureFile) ? ["secure", "off"] : ["secure", "on"])
+    }
+
+    @objc func openSecurePanel() {
+        securePanel.show()
+    }
+
     @objc func openLog() {
         let dir = (logFile as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -373,6 +398,301 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         default:
             break
         }
+    }
+}
+
+
+// MARK: - Secure Background Mode control panel
+
+/// A small window with the six status indicators, the controls and the job
+/// list. Everything it shows comes from `insomnia secure status --porcelain`,
+/// and every button runs an `insomnia` command, so the panel and the command
+/// line can never disagree.
+final class SecurePanel: NSObject, NSWindowDelegate {
+    private var window: NSWindow?
+    private var timer: Timer?
+    private var valueFields: [String: NSTextField] = [:]
+    private let detailView = NSTextView()
+    private let primaryButton = NSButton(title: "Enable Secure Background Mode", target: nil, action: nil)
+    private let keepAwakeButton = NSButton(checkboxWithTitle: "Keep Mac Awake (also with the lid closed)", target: nil, action: nil)
+    private let autoguardButton = NSButton(checkboxWithTitle: "Keep the Mac awake automatically whenever a script drives Chrome", target: nil, action: nil)
+    private var autoguardOn = true
+    private var secureActive = false
+    private var sessionOn = false
+    private var refreshing = false
+
+    private static let rows: [(key: String, title: String)] = [
+        ("secure", "Secure Mode"), ("lock", "Screen Lock"), ("display", "Display"),
+        ("sleep", "System Sleep Prevention"), ("chrome", "Chrome Automation"),
+        ("jobs", "Background Jobs"), ("power", "Power State"),
+    ]
+
+    func show() {
+        if window == nil { build() }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+        refresh()
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func button(_ title: String, _ action: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.bezelStyle = .rounded
+        return b
+    }
+
+    private func build() {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 640),
+                         styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                         backing: .buffered, defer: false)
+        w.title = "Secure Background Mode"
+        w.isReleasedWhenClosed = false
+        w.delegate = self
+        w.minSize = NSSize(width: 560, height: 520)
+
+        let intro = NSTextField(wrappingLabelWithString:
+            "Keeps the Mac awake, locks the screen and turns the display off while your jobs run. "
+            + "Leave the lid open. Chrome and your jobs are never closed, and the lock is the normal macOS password screen.")
+        intro.textColor = .secondaryLabelColor
+
+        let grid = NSGridView()
+        grid.columnSpacing = 16
+        grid.rowSpacing = 8
+        for row in Self.rows {
+            let name = NSTextField(labelWithString: row.title)
+            name.font = .systemFont(ofSize: 13, weight: .medium)
+            let value = NSTextField(labelWithString: "…")
+            value.lineBreakMode = .byTruncatingTail
+            value.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            valueFields[row.key] = value
+            grid.addRow(with: [name, value])
+        }
+
+        primaryButton.target = self
+        primaryButton.action = #selector(togglePrimary)
+        primaryButton.bezelStyle = .rounded
+        primaryButton.toolTip = "Keeps the Mac awake, locks the screen and turns the display off, in that order"
+        keepAwakeButton.target = self
+        keepAwakeButton.action = #selector(toggleKeepAwake)
+        keepAwakeButton.toolTip = "The lid-closed keep-awake session, without locking"
+
+        let controls = NSStackView(views: [
+            primaryButton,
+            button("Lock Mac Screen", #selector(lockScreenNow)),
+            button("Turn Display Off", #selector(displayOff)),
+        ])
+        controls.spacing = 10
+        autoguardButton.target = self
+        autoguardButton.action = #selector(toggleAutoguard)
+
+        let detailTitle = NSTextField(labelWithString: "Active automation jobs and session log")
+        detailTitle.font = .systemFont(ofSize: 13, weight: .medium)
+
+        detailView.isEditable = false
+        detailView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        detailView.textContainerInset = NSSize(width: 6, height: 6)
+        detailView.autoresizingMask = [.width]
+        detailView.isVerticallyResizable = true
+        let scroll = NSScrollView()
+        scroll.documentView = detailView
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+
+        let footer = NSStackView(views: [
+            button("Compatibility Check", #selector(runDoctor)),
+            button("Forget Finished Jobs", #selector(clearJobs)),
+            button("Open Session Log", #selector(openSessionLog)),
+        ])
+        footer.spacing = 10
+
+        let stack = NSStackView(views: [intro, grid, controls, keepAwakeButton, autoguardButton, detailTitle, scroll, footer])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        stack.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let content = NSView()
+        content.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: content.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            scroll.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -36),
+            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 220),
+            intro.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -36),
+            grid.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor, constant: -36),
+        ])
+        w.contentView = content
+        w.center()
+        window = w
+    }
+
+    private func set(_ key: String, _ text: String, _ color: NSColor) {
+        guard let field = valueFields[key] else { return }
+        let s = NSMutableAttributedString(string: "● ", attributes: [.foregroundColor: color])
+        s.append(NSAttributedString(string: text, attributes: [.foregroundColor: NSColor.labelColor]))
+        field.attributedStringValue = s
+        field.toolTip = text
+    }
+
+    private func tail(_ path: String, _ count: Int) -> String {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return "" }
+        return text.split(separator: "\n").suffix(count).joined(separator: "\n")
+    }
+
+    @objc func refresh() {
+        if refreshing { return }
+        refreshing = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let status = run(cli, ["secure", "status", "--porcelain"])
+            let jobs = run(cli, ["jobs"])
+            let log = self.tail(secureLogFile, 12)
+            var kv: [String: String] = [:]
+            for line in status.output.split(separator: "\n") {
+                guard let eq = line.firstIndex(of: "=") else { continue }
+                kv[String(line[..<eq])] = String(line[line.index(after: eq)...])
+            }
+            DispatchQueue.main.async {
+                self.refreshing = false
+                self.apply(kv, jobs: jobs.output, log: log, failed: status.status != 0 ? status.output : nil)
+            }
+        }
+    }
+
+    private func apply(_ kv: [String: String], jobs: String, log: String, failed: String?) {
+        if let failed = failed {
+            detailView.string = "Could not read the status from \(cli):\n\(failed)\n\nRecovery: run ./install.sh in the insomnia-mac folder."
+            return
+        }
+        let green = NSColor.systemGreen, gray = NSColor.tertiaryLabelColor
+        let orange = NSColor.systemOrange, red = NSColor.systemRed
+
+        secureActive = kv["secure"] == "active"
+        sessionOn = kv["session"] == "1"
+        if secureActive {
+            var since = ""
+            if let epoch = TimeInterval(kv["secure_since"] ?? "") {
+                let f = DateFormatter(); f.dateFormat = "HH:mm"
+                since = " since " + f.string(from: Date(timeIntervalSince1970: epoch))
+            }
+            var monitor = kv["monitor"] == "1" ? "" : " (monitor restarting)"
+            if kv["secure_auto"] == "1" { monitor += " (started automatically, not locked by it)" }
+            set("secure", "Active\(since), ends \(kv["secure_ends"] ?? "when turned off")\(monitor)", kv["monitor"] == "1" ? green : orange)
+        } else {
+            set("secure", "Inactive", gray)
+        }
+        set("lock", kv["lock"] == "active" ? "Active" : "Inactive", kv["lock"] == "active" ? green : gray)
+        set("display", kv["display"] == "off" ? "Off" : "On", kv["display"] == "off" ? green : gray)
+        let sleepOn = kv["sleep_prevention"] == "active"
+        set("sleep", "\(sleepOn ? "Active" : "Inactive") (\(kv["sleep_detail"] ?? ""))", sleepOn ? green : gray)
+        let detail = kv["chrome_detail"] ?? ""
+        switch kv["chrome"] ?? "" {
+        case "running": set("chrome", "Running (\(detail))", green)
+        case "paused": set("chrome", "Paused (\(detail))", orange)
+        case "idle": set("chrome", "Idle (\(detail))", gray)
+        default: set("chrome", "Not running", gray)
+        }
+        let running = Int(kv["jobs_running"] ?? "") ?? 0
+        let completed = Int(kv["jobs_completed"] ?? "") ?? 0
+        let failedJobs = Int(kv["jobs_failed"] ?? "") ?? 0
+        set("jobs", "\(running) running, \(completed) completed, \(failedJobs) failed",
+            failedJobs > 0 ? red : (running > 0 ? green : gray))
+        let thermal = Int(kv["thermal"] ?? "") ?? 100
+        let source = kv["power_source"] ?? "?"
+        set("power", "battery \(kv["battery"] ?? "?")% (\(source)), CPU speed limit \(thermal)%, lid \(kv["lid"] ?? "?"), \(kv["displays"] ?? "?") display(s)",
+            (thermal < 100 || source == "discharging") ? orange : green)
+
+        primaryButton.title = secureActive ? "Disable Secure Background Mode" : "Enable Secure Background Mode"
+        keepAwakeButton.state = sleepOn ? .on : .off
+        autoguardOn = kv["autoguard"] != "off"
+        autoguardButton.state = autoguardOn ? .on : .off
+
+        let text = jobs.trimmingCharacters(in: .newlines) + "\n\nSession log\n" + (log.isEmpty ? "(empty)" : log)
+        if detailView.string != text { detailView.string = text }
+    }
+
+    private func command(_ arguments: [String], showOutput: Bool = false) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = run(cli, arguments)
+            DispatchQueue.main.async {
+                self.refresh()
+                if result.status != 0 || showOutput {
+                    let alert = NSAlert()
+                    alert.messageText = result.status == 0 ? "insomnia \(arguments.joined(separator: " "))" : "That did not fully work"
+                    alert.informativeText = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                    alert.alertStyle = result.status == 0 ? .informational : .warning
+                    alert.addButton(withTitle: "OK")
+                    NSApp.activate(ignoringOtherApps: true)
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
+    @objc func togglePrimary() { command(secureActive ? ["secure", "off"] : ["secure", "on"]) }
+    @objc func lockScreenNow() { command(["lock"]) }
+    @objc func displayOff() { command(["display-off"]) }
+    @objc func toggleKeepAwake() { command(sessionOn ? ["off"] : ["on"]) }
+    @objc func toggleAutoguard() { command(["autoguard", autoguardOn ? "off" : "on"]) }
+    @objc func clearJobs() { command(["jobs", "clear"]) }
+    @objc func runDoctor() { command(["doctor"], showOutput: true) }
+    @objc func openSessionLog() {
+        if !FileManager.default.fileExists(atPath: secureLogFile) {
+            FileManager.default.createFile(atPath: secureLogFile, contents: nil)
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: secureLogFile))
+    }
+}
+
+// MARK: - helper mode
+//
+// `Insomnia --lock` and `Insomnia --state` let the insomnia command line tool
+// lock the screen and read the lock, display and lid state without starting
+// the menu bar app. Anything else falls through to the normal app.
+
+func screenIsLocked() -> Bool {
+    guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+    return (session["CGSSessionScreenIsLocked"] as? NSNumber)?.boolValue ?? false
+}
+
+func lidIsClosed() -> Bool? {
+    let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+    guard root != 0 else { return nil }
+    defer { IOObjectRelease(root) }
+    guard let value = IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)?
+        .takeRetainedValue() as? NSNumber else { return nil }
+    return value.boolValue
+}
+
+if CommandLine.arguments.count > 1 {
+    switch CommandLine.arguments[1] {
+    case "--lock":
+        exit(lockScreen() ? 0 : 1)
+    case "--show-panel":
+        DistributedNotificationCenter.default().postNotificationName(
+            Notification.Name("com.usman.insomnia.showPanel"), object: nil, userInfo: nil, deliverImmediately: true)
+        exit(0)
+    case "--state":
+        var displays: UInt32 = 0
+        CGGetOnlineDisplayList(0, nil, &displays)
+        print("locked=\(screenIsLocked() ? 1 : 0)")
+        print("display=\(CGDisplayIsAsleep(CGMainDisplayID()) != 0 ? "off" : "on")")
+        if let closed = lidIsClosed() { print("lid=\(closed ? "closed" : "open")") }
+        print("displays=\(displays)")
+        exit(0)
+    default:
+        break
     }
 }
 

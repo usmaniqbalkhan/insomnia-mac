@@ -4,8 +4,9 @@ set -u
 USER_ID="$(id -u)"
 BIN=/usr/local/bin/insomnia
 
+[ -x "$BIN" ] && "$BIN" secure off >/dev/null 2>&1 || true
 [ -x "$BIN" ] && "$BIN" off 2>/dev/null || true
-for name in backstop netguard menubar; do
+for name in backstop netguard secure autoguard menubar; do
   launchctl bootout "gui/$USER_ID/com.usman.insomnia.$name" 2>/dev/null || true
   rm -f "$HOME/Library/LaunchAgents/com.usman.insomnia.$name.plist"
 done

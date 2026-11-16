@@ -13,10 +13,25 @@
 #   insomnia setup         print the one command that needs your password
 #   insomnia backstop      run by launchd every minute: timer, battery floor,
 #                          and re-apply if macOS flipped the bit back
-#   insomnia netguard      run by launchd while a session is on: pings the
+#   insomnia netguard      run by launchd: while a session or Secure Background
+#                          Mode is on, or while Claude is working, pings the
 #                          router every 5 s and restarts Wi-Fi when the link
-#                          has been dead for 30 s, so a dropped connection
-#                          comes back on its own
+#                          has been dead for 30 s
+#
+# Secure Background Mode (lid open, screen locked, display off, jobs running):
+#   insomnia secure on [2h] [--hold]   keep awake, lock the screen, turn the
+#                          display off; ends by itself when all jobs finish
+#   insomnia secure off    end it (never unlocks the screen)
+#   insomnia secure status the six indicators, power state and jobs
+#   insomnia run [--name N] [--detach] -- cmd ...   run a command as a job
+#   insomnia watch <pid> [name]        track an already running process
+#   insomnia jobs [clear]  list jobs (clear forgets finished ones)
+#   insomnia lock          lock the screen now
+#   insomnia display-off   lock, then turn the display off
+#   insomnia panel         open the control panel window
+#   insomnia doctor        hardware, macOS and Chrome compatibility check
+#   insomnia autoguard on|off|status   keep the Mac awake by itself whenever a
+#                          script is driving Chrome (on by default)
 #
 # Needs a sudoers rule (written by `insomnia setup`) that lets this user run
 # exactly two commands without a password:
@@ -41,11 +56,25 @@ NET_PROBE_INTERVAL=5     # seconds between probes while a session is on
 NET_DOWN_AFTER=20        # seconds without any reply before the link is called down
 NET_REPAIR_AFTER=30      # seconds without any reply before Wi-Fi is restarted
 
+# Secure Background Mode
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+HELPER="$HOME/Applications/Insomnia.app/Contents/MacOS/Insomnia"   # the menu bar app doubles as a helper
+SECURE="$APP_SUPPORT/secure"          # exists while Secure Background Mode is on (key=value lines)
+SECURE_RUN="$APP_SUPPORT/secure.run"  # pids of the running monitor and its caffeinate
+JOBS_DIR="$APP_SUPPORT/jobs"          # one <id>.job file per tracked job (key=value lines)
+JOB_LOG_DIR="$LOG_DIR/jobs"
+SECURE_LOG="$LOG_DIR/secure.log"
+SECURE_LABEL="com.usman.insomnia.secure"
+MONITOR_INTERVAL=10                                  # seconds between monitor passes
+AUTOGUARD_OFF="$APP_SUPPORT/autoguard.off"           # exists when the automatic guard is switched off
+AUTOGUARD_INTERVAL=20                                # seconds between automatic-guard passes
+RELEASE_GRACE="${INSOMNIA_RELEASE_GRACE:-120}"       # seconds with no running job before auto-release
+
 log() { mkdir -p "$LOG_DIR"; printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
 die() { echo "insomnia: $*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # Prints 1 when system sleep is disabled, else 0.
@@ -184,6 +213,11 @@ cmd_status() {
     echo "Network guard log (last 3):"
     tail -3 "$NETGUARD_LOG" | sed 's/^/  /'
   fi
+  if [ -f "$SECURE" ]; then
+    echo "Secure Background Mode: ACTIVE (see 'insomnia secure status')."
+  else
+    echo "Secure Background Mode: inactive."
+  fi
 }
 
 # ---------- network guard ----------
@@ -229,11 +263,39 @@ wifi_restart() {
 }
 
 # Long-running; launchd keeps it alive. Idle while no session is on.
+# The guard is wanted while a keep-awake session or Secure Background Mode is
+# on, and also while the Claude app holds its own "do not idle-sleep"
+# assertion, which it does while a session of its is working. In that last
+# case the Mac is awake anyway, and a dropped Wi-Fi link is the one thing that
+# would still stop the work.
+NETGUARD_WANTED=0; NETGUARD_CHECKED=0; NETGUARD_WHY=""
+netguard_wanted() {
+  local now why=""
+  now="$(date +%s)"
+  if [ -f "$STATE" ]; then why="keep-awake session"
+  elif [ -f "$SECURE" ]; then why="Secure Background Mode"
+  elif [ $(( now - NETGUARD_CHECKED )) -lt 30 ]; then
+    [ "$NETGUARD_WANTED" = 1 ]; return
+  elif "$PMSET" -g assertions 2>/dev/null | grep -q '(Claude).*NoIdleSleepAssertion'; then why="Claude is working"
+  fi
+  NETGUARD_CHECKED="$now"
+  if [ -n "$why" ]; then
+    [ "$why" = "$NETGUARD_WHY" ] || nlog "guarding the connection: $why"
+    NETGUARD_WANTED=1
+  else
+    [ -z "$NETGUARD_WHY" ] || nlog "nothing needs the connection guarded any more; idle"
+    NETGUARD_WANTED=0
+  fi
+  NETGUARD_WHY="$why"
+  [ "$NETGUARD_WANTED" = 1 ]
+}
+
 cmd_netguard() {
   local now first_fail=0 declared_down=0 repairs=0 last_repair=0 down_for wait
   nlog "netguard started: probe every ${NET_PROBE_INTERVAL}s, down after ${NET_DOWN_AFTER}s, Wi-Fi restart after ${NET_REPAIR_AFTER}s ($(wifi_state))"
   while :; do
-    if [ ! -f "$STATE" ]; then
+    if ! netguard_wanted; then
+      first_fail=0; declared_down=0; repairs=0
       sleep 30
       continue
     fi
@@ -299,6 +361,774 @@ cmd_setup() {
   setup_hint
 }
 
+# ---------- Secure Background Mode ----------
+#
+# Lid open, screen locked, display off, jobs still running. Three independent
+# pieces, each a stock macOS mechanism:
+#   keep awake   a `caffeinate -i -m -s` assertion held by the monitor (it is
+#                released the moment the monitor exits), plus the disablesleep
+#                session when the sudoers rule is installed, so closing the lid
+#                by accident does not sleep the Mac either
+#   lock         SACLockScreenImmediate through the app helper; the password
+#                screen is macOS's own and is never bypassed or unlocked here
+#   display off  `pmset displaysleepnow`, only after the lock is confirmed
+# A monitor (launchd keeps it alive while $SECURE exists) tracks jobs and ends
+# the mode once every job has finished. Nothing here closes Chrome or signals
+# a job.
+
+slog() { mkdir -p "$LOG_DIR"; printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$SECURE_LOG"; }
+
+kv_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
+kv_set() {  # file key value (value is flattened to one line; the write is atomic)
+  local f="$1" k="$2" v tmp
+  v="$(printf '%s' "$3" | tr '\n\r' '  ')"
+  tmp="$f.tmp.$$"
+  { grep -v "^$k=" "$f" 2>/dev/null; printf '%s=%s\n' "$k" "$v"; } > "$tmp" && mv -f "$tmp" "$f"
+}
+
+# A pid plus its start time identifies a process even after the pid is reused.
+pid_start() { ps -o lstart= -p "$1" 2>/dev/null | sed -e 's/^ *//' -e 's/ *$//'; }
+pid_alive() {  # pid [start]
+  local s
+  [ -n "${1:-}" ] || return 1
+  s="$(pid_start "$1")"
+  [ -n "$s" ] || return 1
+  [ -z "${2:-}" ] || [ "$s" = "$2" ]
+}
+
+fmt_dur() {
+  local s="$1"
+  if [ "$s" -ge 3600 ]; then printf '%dh%02dm' $(( s / 3600 )) $(( s % 3600 / 60 ))
+  elif [ "$s" -ge 60 ]; then printf '%dm%02ds' $(( s / 60 )) $(( s % 60 ))
+  else printf '%ds' "$s"
+  fi
+}
+
+helper_ok() { [ -x "$HELPER" ]; }
+# Prints locked=0|1, display=on|off, lid=open|closed, displays=N, one per line.
+helper_state() { "$HELPER" --state 2>/dev/null; }
+hs_get() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1; }
+
+thermal_limit() {  # CPU speed limit in percent; 100 = not throttled
+  local v
+  v="$("$PMSET" -g therm 2>/dev/null | awk -F= '/CPU_Speed_Limit/{gsub(/[ \t]/,"",$2); print $2}')"
+  echo "${v:-100}"
+}
+
+# ----- jobs -----
+
+job_create() {  # id name kind pid cmd -> prints the job file
+  local f="$JOBS_DIR/$1.job"
+  mkdir -p "$JOBS_DIR" "$JOB_LOG_DIR"
+  : > "$f"
+  kv_set "$f" id "$1"
+  kv_set "$f" name "$2"
+  kv_set "$f" kind "$3"
+  kv_set "$f" cmd "$5"
+  kv_set "$f" started "$(date +%s)"
+  if [ -n "$4" ]; then
+    kv_set "$f" pid "$4"
+    kv_set "$f" pid_start "$(pid_start "$4")"
+  fi
+  kv_set "$f" status running
+  echo "$f"
+}
+
+# Settles jobs whose process has gone. A `run` job normally records its own
+# result; this only steps in when its wrapper died first.
+refresh_jobs() {
+  local f kind pid ps wpid wps now
+  now="$(date +%s)"
+  for f in "$JOBS_DIR"/*.job; do
+    [ -f "$f" ] || continue
+    [ "$(kv_get "$f" status)" = running ] || continue
+    kind="$(kv_get "$f" kind)"; pid="$(kv_get "$f" pid)"; ps="$(kv_get "$f" pid_start)"
+    if [ "$kind" = run ]; then
+      wpid="$(kv_get "$f" wrapper_pid)"; wps="$(kv_get "$f" wrapper_start)"
+      pid_alive "$wpid" "$wps" && continue
+      [ "$(kv_get "$f" status)" = running ] || continue   # it finished between the two reads
+      if pid_alive "$pid" "$ps"; then
+        kv_set "$f" kind watch
+        kv_set "$f" note "wrapper exited early; the process is still tracked"
+        slog "job $(kv_get "$f" id) '$(kv_get "$f" name)': wrapper exited early, still tracking pid $pid"
+        continue
+      fi
+      kv_set "$f" exit unknown
+      kv_set "$f" ended "$now"
+      kv_set "$f" note "wrapper died before it could record an exit code"
+      kv_set "$f" status failed
+      slog "job $(kv_get "$f" id) '$(kv_get "$f" name)' FAILED: wrapper died before recording an exit code"
+    else
+      pid_alive "$pid" "$ps" && continue
+      kv_set "$f" exit unknown
+      kv_set "$f" ended "$now"
+      kv_set "$f" status completed
+      slog "job $(kv_get "$f" id) '$(kv_get "$f" name)' finished (watched process exited; its exit code is not available)"
+    fi
+  done
+}
+
+job_counts() {
+  local f
+  JOBS_RUNNING=0; JOBS_COMPLETED=0; JOBS_FAILED=0
+  for f in "$JOBS_DIR"/*.job; do
+    [ -f "$f" ] || continue
+    case "$(kv_get "$f" status)" in
+      running)   JOBS_RUNNING=$(( JOBS_RUNNING + 1 )) ;;
+      completed) JOBS_COMPLETED=$(( JOBS_COMPLETED + 1 )) ;;
+      failed)    JOBS_FAILED=$(( JOBS_FAILED + 1 )) ;;
+    esac
+  done
+}
+
+# insomnia run [--name NAME] [--detach] -- command [args...]
+cmd_run() {
+  local name="" detach=0 id="" f joblog child rc
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)   name="${2:-}"; shift 2 ;;
+      --detach) detach=1; shift ;;
+      --id)     id="${2:-}"; shift 2 ;;
+      --)       shift; break ;;
+      *)        break ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "usage: insomnia run [--name NAME] [--detach] -- command [args...]"
+  [ -n "$id" ] || id="$(date +%Y%m%d-%H%M%S)-$$"
+  [ -n "$name" ] || name="$(basename "$1")"
+  if [ "$detach" = 1 ]; then
+    nohup "$SELF" run --name "$name" --id "$id" -- "$@" >/dev/null 2>&1 &
+    echo "$id"
+    return 0
+  fi
+  f="$(job_create "$id" "$name" run "" "$*")"
+  joblog="$JOB_LOG_DIR/$id.log"
+  kv_set "$f" log "$joblog"
+  kv_set "$f" wrapper_pid "$$"
+  kv_set "$f" wrapper_start "$(pid_start "$$")"
+  trap '' HUP
+  if [ -t 1 ]; then
+    "$@" > >(tee -a "$joblog") 2>&1 &
+  else
+    "$@" >> "$joblog" 2>&1 &
+  fi
+  child=$!
+  kv_set "$f" pid "$child"
+  kv_set "$f" pid_start "$(pid_start "$child")"
+  slog "job $id '$name' started (pid $child)"
+  trap 'kill -TERM "$child" 2>/dev/null' TERM INT
+  wait "$child"; rc=$?
+  while kill -0 "$child" 2>/dev/null; do wait "$child"; rc=$?; done
+  kv_set "$f" exit "$rc"
+  kv_set "$f" ended "$(date +%s)"
+  if [ "$rc" = 0 ]; then
+    kv_set "$f" status completed
+    slog "job $id '$name' completed (exit 0)"
+  else
+    kv_set "$f" status failed
+    slog "job $id '$name' FAILED (exit $rc), log: $joblog"
+  fi
+  exit "$rc"
+}
+
+# insomnia watch <pid> [name]
+cmd_watch() {
+  local pid="${1:-}" name="${2:-}" cmd id
+  case "$pid" in ""|*[!0-9]*) die "usage: insomnia watch <pid> [name]" ;; esac
+  cmd="$(ps -o command= -p "$pid" 2>/dev/null)"
+  [ -n "$cmd" ] || die "no process with pid $pid"
+  [ -n "$name" ] || name="$(printf '%s' "$cmd" | cut -c1-60)"
+  id="$(date +%Y%m%d-%H%M%S)-$pid"
+  job_create "$id" "$name" watch "$pid" "$cmd" >/dev/null
+  slog "job $id '$name' registered (watching pid $pid)"
+  echo "$id"
+}
+
+# insomnia jobs [clear|--porcelain]
+cmd_jobs() {
+  local f st now started ended dur n=0
+  if [ "${1:-}" = clear ]; then
+    refresh_jobs
+    for f in "$JOBS_DIR"/*.job; do
+      [ -f "$f" ] || continue
+      [ "$(kv_get "$f" status)" = running ] && continue
+      rm -f "$f"; n=$(( n + 1 ))
+    done
+    echo "Forgot $n finished job(s). Their logs stay in $JOB_LOG_DIR."
+    return 0
+  fi
+  refresh_jobs
+  now="$(date +%s)"
+  [ "${1:-}" = --porcelain ] || printf '%-22s %-10s %-8s %-8s %s\n' ID STATUS RUNTIME EXIT NAME
+  for f in "$JOBS_DIR"/*.job; do
+    [ -f "$f" ] || continue
+    n=$(( n + 1 ))
+    st="$(kv_get "$f" status)"; started="$(kv_get "$f" started)"; ended="$(kv_get "$f" ended)"
+    dur=$(( ${ended:-$now} - ${started:-$now} ))
+    if [ "${1:-}" = --porcelain ]; then
+      printf '%s|%s|%s|%s|%s|%s\n' "$(kv_get "$f" id)" "$st" "$dur" "$(kv_get "$f" exit)" "$(kv_get "$f" pid)" "$(kv_get "$f" name)"
+    else
+      printf '%-22s %-10s %-8s %-8s %s\n' "$(kv_get "$f" id)" "$st" "$(fmt_dur "$dur")" "$(kv_get "$f" exit)" "$(kv_get "$f" name)"
+    fi
+  done
+  if [ "$n" = 0 ] && [ "${1:-}" != --porcelain ]; then
+    echo "(no jobs; start one with: insomnia run -- <command>, or track a running one with: insomnia watch <pid>)"
+  fi
+}
+
+# ----- Chrome automation detection -----
+
+# Finds browser main processes and whoever is driving them. A driver is a
+# process holding a TCP connection to a --remote-debugging-port (Playwright
+# connectOverCDP, Puppeteer connect, chromedriver), or the parent of a browser
+# started with --remote-debugging-pipe (Playwright/Puppeteer launch).
+# Extension-based automation has no outside trace and cannot be detected.
+chrome_scan() {
+  local pid ppid stat rest port c ccmd mains=" "
+  CH_COUNT=0; CH_STOPPED=0; CH_PORTS=""; CH_DRIVERS=""; CH_HEADLESS=0; CH_UNTHROTTLED=0
+  while read -r pid ppid stat rest; do
+    case "$rest" in
+      *"--type="*) continue ;;
+      /*"/Contents/MacOS/Google Chrome"*|/*"/Contents/MacOS/Chromium"*|/*"/Contents/MacOS/Microsoft Edge"*) ;;
+      *) continue ;;
+    esac
+    case "$mains" in *" $ppid "*) continue ;; esac   # a fork of a browser that has not exec'd its helper yet
+    mains="$mains$pid "
+    CH_COUNT=$(( CH_COUNT + 1 ))
+    case "$stat" in *T*) CH_STOPPED=$(( CH_STOPPED + 1 )) ;; esac
+    case "$rest" in *"--headless"*) CH_HEADLESS=$(( CH_HEADLESS + 1 )) ;; esac
+    case "$rest" in *"--disable-backgrounding-occluded-windows"*) CH_UNTHROTTLED=$(( CH_UNTHROTTLED + 1 )) ;; esac
+    if [[ "$rest" =~ --remote-debugging-port=([0-9]+) ]]; then
+      port="${BASH_REMATCH[1]}"
+      if [ "$port" != 0 ]; then
+        CH_PORTS="$CH_PORTS $port"
+        for c in $(lsof -nP -a -iTCP:"$port" -sTCP:ESTABLISHED -Fp 2>/dev/null | sed -n 's/^p//p' | sort -u); do
+          [ "$c" = "$pid" ] && continue
+          [ "$c" = "$$" ] && continue
+          ccmd="$(ps -o command= -p "$c" 2>/dev/null)"
+          case "$ccmd" in ""|*"Google Chrome"*|*Chromium*|*"Microsoft Edge"*) continue ;; esac
+          CH_DRIVERS="$CH_DRIVERS $c"
+        done
+      fi
+    fi
+    case "$rest" in
+      *"--remote-debugging-pipe"*) [ "$ppid" -gt 1 ] && CH_DRIVERS="$CH_DRIVERS $ppid" ;;
+    esac
+  done < <(ps -axo pid=,ppid=,stat=,command=)
+  CH_PORTS="$(printf '%s\n' $CH_PORTS | sort -un | tr '\n' ' ')"
+  CH_PORTS="$(echo $CH_PORTS)"
+  CH_DRIVERS="$(printf '%s\n' $CH_DRIVERS | sort -un | tr '\n' ' ')"
+  CH_DRIVERS="$(echo $CH_DRIVERS)"
+}
+
+chrome_status() {  # needs chrome_scan; sets CHROME_STATE and CHROME_DETAIL
+  local nd
+  set -- $CH_DRIVERS; nd=$#
+  if [ "$CH_COUNT" = 0 ]; then
+    CHROME_STATE=not_running; CHROME_DETAIL="Chrome is not running"
+  elif [ "$CH_STOPPED" -gt 0 ]; then
+    CHROME_STATE=paused; CHROME_DETAIL="$CH_STOPPED Chrome process(es) stopped"
+  elif [ "$nd" -gt 0 ]; then
+    CHROME_STATE=running; CHROME_DETAIL="$nd driver(s) connected to $CH_COUNT browser(s)${CH_PORTS:+, CDP ports $CH_PORTS}"
+  elif [ -n "$CH_PORTS" ]; then
+    CHROME_STATE=idle; CHROME_DETAIL="CDP ports open ($CH_PORTS), no driver connected"
+  else
+    CHROME_STATE=idle; CHROME_DETAIL="Chrome open, no CDP driver detected"
+  fi
+}
+
+# Registers a driver as a job once it has been seen in two passes in a row,
+# so a one-off connection (a curl to /json, a quick inspect) is not adopted.
+adopt_drivers() {  # $1 = drivers seen in the previous pass
+  local prev=" $1 " d f tracked cmd id
+  for d in $CH_DRIVERS; do
+    case "$prev" in *" $d "*) ;; *) continue ;; esac
+    tracked=0
+    for f in "$JOBS_DIR"/*.job; do
+      [ -f "$f" ] || continue
+      [ "$(kv_get "$f" status)" = running ] || continue
+      if [ "$(kv_get "$f" pid)" = "$d" ] || [ "$(kv_get "$f" wrapper_pid)" = "$d" ]; then tracked=1; break; fi
+    done
+    [ "$tracked" = 1 ] && continue
+    cmd="$(ps -o command= -p "$d" 2>/dev/null)"
+    [ -n "$cmd" ] || continue
+    id="$(date +%Y%m%d-%H%M%S)-$d"
+    job_create "$id" "auto: $(printf '%s' "$cmd" | cut -c1-60)" watch "$d" "$cmd" >/dev/null
+    slog "adopted pid $d as job $id because it drives Chrome over CDP: $(printf '%s' "$cmd" | cut -c1-120)"
+  done
+}
+
+# ----- lock and display -----
+
+secure_lock() {  # 0 once macOS reports the session locked
+  local i
+  [ "$(hs_get "$(helper_state)" locked)" = 1 ] && return 0
+  "$HELPER" --lock >/dev/null 2>&1
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+    sleep 0.5
+    [ "$(hs_get "$(helper_state)" locked)" = 1 ] && return 0
+  done
+  return 1
+}
+
+display_off() {  # 0 once the main display reports asleep
+  local i
+  "$PMSET" displaysleepnow >/dev/null 2>&1
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    sleep 0.5
+    [ "$(hs_get "$(helper_state)" display)" = off ] && return 0
+  done
+  return 1
+}
+
+need_helper() {
+  helper_ok || die "the Insomnia app is missing at $HELPER, and it is what locks the screen. Recovery: run ./install.sh in the insomnia-mac folder, then try again."
+}
+
+cmd_lock() {
+  need_helper
+  if secure_lock; then echo "Screen locked."; else die "macOS did not report the screen as locked. Press Control-Command-Q to lock it by hand."; fi
+}
+
+cmd_display_off() {
+  need_helper
+  secure_lock || die "the screen lock could not be confirmed, so the display was left on. Press Control-Command-Q, then run 'insomnia display-off' again."
+  if display_off; then echo "Screen locked and display off."; else die "macOS did not turn the display off (something may be holding it on, such as a playing video). The screen is locked."; fi
+}
+
+cmd_panel() {
+  need_helper
+  if ! pgrep -x Insomnia >/dev/null; then
+    launchctl kickstart "gui/$(id -u)/com.usman.insomnia.menubar" >/dev/null 2>&1 || open -g "$HOME/Applications/Insomnia.app"
+    sleep 2
+  fi
+  "$HELPER" --show-panel
+}
+
+# ----- the mode itself -----
+
+monitor_alive() { pid_alive "$(kv_get "$SECURE_RUN" monitor_pid)" "$(kv_get "$SECURE_RUN" monitor_start)"; }
+caffeinate_alive() {
+  local p
+  p="$(kv_get "$SECURE_RUN" caffeinate_pid)"
+  [ -n "$p" ] && ps -o command= -p "$p" 2>/dev/null | grep -q caffeinate
+}
+
+start_monitor() {
+  if launchctl print "gui/$(id -u)/$SECURE_LABEL" >/dev/null 2>&1; then
+    launchctl kickstart "gui/$(id -u)/$SECURE_LABEL" >/dev/null 2>&1
+  else
+    nohup "$SELF" secure-monitor >/dev/null 2>&1 &
+  fi
+}
+
+secure_release() {  # $1 = reason. Ends the mode; never touches the lock, Chrome or any job.
+  local owns
+  owns="$(kv_get "$SECURE" owns_session)"
+  job_counts
+  slog "Secure Background Mode OFF: $1 (jobs: $JOBS_RUNNING running, $JOBS_COMPLETED completed, $JOBS_FAILED failed)"
+  rm -f "$SECURE"
+  if [ "$owns" = 1 ] && [ -f "$STATE" ]; then
+    if ( cmd_off quiet ) 2>/dev/null; then slog "lid-close protection off, normal sleep restored"; fi
+  fi
+}
+
+# insomnia secure on [duration] [--hold] [--grace SECONDS] [--no-lock] [--no-display-off]
+cmd_secure_on() {
+  local dur="" hold=0 grace="$RELEASE_GRACE" do_lock=1 do_display=1 secs until=0 owns=0 i rc=0 lockok=0
+  local auto=0 grace_given=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --hold)            hold=1; shift ;;
+      --auto)            auto=1; shift ;;
+      --grace)           grace="${2:-}"; grace_given=1; shift 2 ;;
+      --no-lock)         do_lock=0; do_display=0; shift ;;
+      --no-display-off)  do_display=0; shift ;;
+      *)                 dur="$1"; shift ;;
+    esac
+  done
+  case "$grace" in ""|*[!0-9]*) die "bad --grace '$grace' (seconds)" ;; esac
+  [ "$(uname -s)" = Darwin ] || die "Secure Background Mode needs macOS"
+  need_helper
+  if [ -n "$dur" ]; then
+    secs="$(parse_duration "$dur")" || die "bad duration '$dur' (try 30m, 2h, 1d)"
+    until=$(( $(date +%s) + secs ))
+  fi
+  mkdir -p "$APP_SUPPORT" "$JOBS_DIR"
+
+  echo "Secure Background Mode"
+  if [ -f "$SECURE" ]; then
+    echo "  mode          already active since $(date -r "$(kv_get "$SECURE" started)" '+%H:%M')"
+    # Anything asked for explicitly applies to the running mode too.
+    [ "$hold" = 1 ] && kv_set "$SECURE" hold 1
+    [ "$grace_given" = 1 ] && kv_set "$SECURE" grace "$grace"
+    [ "$until" != 0 ] && kv_set "$SECURE" until "$until"
+    [ "$auto" = 1 ] || kv_set "$SECURE" auto 0
+  else
+    if [ ! -f "$STATE" ]; then
+      if rule_installed && set_bit 1 2>/dev/null; then
+        printf '0\n' > "$STATE"; owns=1
+        log "ON until turned off (started by Secure Background Mode)"
+      fi
+    fi
+    : > "$SECURE"
+    kv_set "$SECURE" started "$(date +%s)"
+    kv_set "$SECURE" owns_session "$owns"
+    kv_set "$SECURE" hold "$hold"
+    kv_set "$SECURE" grace "$grace"
+    kv_set "$SECURE" until "$until"
+    kv_set "$SECURE" seen_jobs 0
+    kv_set "$SECURE" auto "$auto"
+    slog "Secure Background Mode ON (hold=$hold, grace=${grace}s, until=$until, lid-close protection=$owns, started by $([ "$auto" = 1 ] && echo the automatic guard || echo the user))"
+    start_monitor
+  fi
+
+  # 1. keep awake
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    caffeinate_alive && break
+    sleep 0.5
+  done
+  if caffeinate_alive; then
+    if [ "$(sleep_disabled)" = 1 ]; then
+      echo "  keep awake    ok    sleep assertion held, and closing the lid will not sleep the Mac"
+    else
+      echo "  keep awake    ok    sleep assertion held (lid must stay open: run 'insomnia setup' for lid-close protection)"
+    fi
+  else
+    echo "  keep awake    FAIL  the monitor did not start; run 'insomnia doctor'"
+    slog "keep awake could not be confirmed"
+    rc=4
+  fi
+
+  # 2. lock, 3. display off (only behind a confirmed lock)
+  if [ "$do_lock" = 1 ]; then
+    if secure_lock; then
+      lockok=1
+      echo "  screen lock   ok    locked, password required"
+    else
+      echo "  screen lock   FAIL  macOS did not report the screen as locked"
+      echo "                      Recovery: press Control-Command-Q, then run 'insomnia display-off'."
+      slog "screen lock could not be confirmed; display left on"
+      [ "$rc" = 0 ] && rc=3
+    fi
+    if [ "$do_display" = 1 ]; then
+      if [ "$lockok" != 1 ]; then
+        echo "  display       left on, because turning it off without a confirmed lock would hide an open desktop"
+      elif display_off; then
+        echo "  display       ok    off"
+      else
+        echo "  display       FAIL  still on (something holds it on, such as a playing video); the screen is locked"
+        slog "display did not turn off"
+        [ "$rc" = 0 ] && rc=5
+      fi
+    fi
+  else
+    echo "  screen lock   skipped (--no-lock)"
+  fi
+
+  refresh_jobs; job_counts
+  echo "  jobs          $JOBS_RUNNING running"
+  if [ "$until" != 0 ]; then
+    echo "Ends at $(fmt_end "$until") at the latest."
+  fi
+  if [ "$hold" = 1 ]; then
+    echo "Stays on until 'insomnia secure off'."
+  elif [ "$JOBS_RUNNING" -gt 0 ]; then
+    echo "Ends by itself ${grace}s after the last job finishes. Unlock with your password as usual."
+  else
+    echo "No job is registered yet. A script that drives Chrome over CDP is picked up within ${MONITOR_INTERVAL}-$(( MONITOR_INTERVAL * 2 ))s;"
+    echo "until one has run, the mode stays on until 'insomnia secure off'."
+  fi
+  return "$rc"
+}
+
+cmd_secure_off() {
+  local mp mps cp
+  if [ ! -f "$SECURE" ]; then
+    echo "Secure Background Mode is not active."
+    return 0
+  fi
+  mp="$(kv_get "$SECURE_RUN" monitor_pid)"; mps="$(kv_get "$SECURE_RUN" monitor_start)"
+  cp="$(kv_get "$SECURE_RUN" caffeinate_pid)"
+  secure_release "turned off by the user"
+  if pid_alive "$mp" "$mps"; then kill -TERM "$mp" 2>/dev/null; fi
+  if [ -n "$cp" ] && ps -o command= -p "$cp" 2>/dev/null | grep -q caffeinate; then kill "$cp" 2>/dev/null; fi
+  rm -f "$SECURE_RUN"
+  echo "Secure Background Mode is off. Sleep prevention is released; the screen lock, Chrome and jobs are untouched."
+}
+
+# Run by launchd while $SECURE exists (and directly as a fallback).
+cmd_secure_monitor() {
+  local caf prev_drivers="" idle_since=0 now hs lock disp last_lock="" last_disp="" therm last_therm=100
+  local until hold grace pct state last_batt=0
+  [ -f "$SECURE" ] || exit 0
+  if monitor_alive && [ "$(kv_get "$SECURE_RUN" monitor_pid)" != "$$" ]; then exit 0; fi
+  mkdir -p "$JOBS_DIR"
+  : > "$SECURE_RUN"
+  kv_set "$SECURE_RUN" monitor_pid "$$"
+  kv_set "$SECURE_RUN" monitor_start "$(pid_start "$$")"
+  /usr/bin/caffeinate -i -m -s -w "$$" &
+  caf=$!
+  kv_set "$SECURE_RUN" caffeinate_pid "$caf"
+  slog "monitor started (pid $$); sleep assertion held by caffeinate (pid $caf)"
+  trap 'kill "$caf" 2>/dev/null; exit 0' TERM INT
+
+  while [ -f "$SECURE" ]; do
+    now="$(date +%s)"
+    if ! kill -0 "$caf" 2>/dev/null; then
+      /usr/bin/caffeinate -i -m -s -w "$$" &
+      caf=$!
+      kv_set "$SECURE_RUN" caffeinate_pid "$caf"
+      slog "caffeinate had exited; sleep assertion re-created (pid $caf)"
+    fi
+
+    refresh_jobs
+    chrome_scan
+    adopt_drivers "$prev_drivers"
+    prev_drivers="$CH_DRIVERS"
+    job_counts
+    if [ "$JOBS_RUNNING" -gt 0 ]; then
+      [ "$(kv_get "$SECURE" seen_jobs)" = 1 ] || kv_set "$SECURE" seen_jobs 1
+      idle_since=0
+    fi
+
+    hs="$(helper_state)"; lock="$(hs_get "$hs" locked)"; disp="$(hs_get "$hs" display)"
+    if [ -n "$lock" ] && [ "$lock" != "$last_lock" ]; then
+      if [ "$lock" = 1 ]; then slog "screen is locked"; elif [ -n "$last_lock" ]; then slog "screen unlocked (the user authenticated)"; fi
+      last_lock="$lock"
+    fi
+    if [ -n "$disp" ] && [ "$disp" != "$last_disp" ]; then
+      [ -n "$last_disp" ] && slog "display turned $disp"
+      last_disp="$disp"
+    fi
+
+    therm="$(thermal_limit)"
+    if [ "$therm" != "$last_therm" ]; then
+      slog "thermal: CPU speed limit ${therm}% (was ${last_therm}%)"
+      last_therm="$therm"
+    fi
+    read -r pct state <<< "$(battery_info)"
+    if [ $(( now - last_batt )) -ge 900 ]; then
+      slog "power: battery ${pct}% ($state), CPU speed limit ${therm}%, jobs running: $JOBS_RUNNING"
+      last_batt="$now"
+    fi
+
+    until="$(kv_get "$SECURE" until)"; hold="$(kv_get "$SECURE" hold)"; grace="$(kv_get "$SECURE" grace)"
+    if [ "${until:-0}" != 0 ] && [ "$now" -ge "$until" ]; then
+      secure_release "timer ended"; break
+    fi
+    if [ "$state" = discharging ] && [ "$pct" -le "$BATTERY_FLOOR" ]; then
+      secure_release "battery ${pct}% is at or below the ${BATTERY_FLOOR}% floor"; break
+    fi
+    if [ "$hold" != 1 ] && [ "$(kv_get "$SECURE" seen_jobs)" = 1 ] && [ "$JOBS_RUNNING" = 0 ]; then
+      [ "$idle_since" = 0 ] && idle_since="$now"
+      if [ $(( now - idle_since )) -ge "${grace:-$RELEASE_GRACE}" ]; then
+        secure_release "all jobs finished"; break
+      fi
+    fi
+
+    sleep "$MONITOR_INTERVAL" &
+    wait $!
+  done
+  kill "$caf" 2>/dev/null
+  rm -f "$SECURE_RUN"
+  slog "monitor stopped; sleep assertion released"
+}
+
+secure_snapshot() {
+  local hs
+  refresh_jobs; job_counts; chrome_scan; chrome_status
+  hs="$(helper_state)"
+  S_LOCKED="$(hs_get "$hs" locked)"; S_DISPLAY="$(hs_get "$hs" display)"
+  S_LID="$(hs_get "$hs" lid)"; S_DISPLAYS="$(hs_get "$hs" displays)"
+  S_SECURE=inactive; [ -f "$SECURE" ] && S_SECURE=active
+  S_MONITOR=0; monitor_alive && S_MONITOR=1
+  S_CAFF=0; caffeinate_alive && S_CAFF=1
+  S_BIT="$(sleep_disabled)"
+  S_SLEEP=inactive; S_SLEEP_DETAIL="the Mac may idle-sleep"
+  if [ "$S_CAFF" = 1 ] && [ "$S_BIT" = 1 ]; then S_SLEEP=active; S_SLEEP_DETAIL="sleep assertion + lid-close protection"
+  elif [ "$S_CAFF" = 1 ]; then S_SLEEP=active; S_SLEEP_DETAIL="sleep assertion (lid must stay open)"
+  elif [ "$S_BIT" = 1 ]; then S_SLEEP=active; S_SLEEP_DETAIL="keep-awake session (lid may be closed)"
+  fi
+  read -r S_BATT S_POWER <<< "$(battery_info)"
+  S_THERM="$(thermal_limit)"
+}
+
+# insomnia secure status [--porcelain]
+cmd_secure_status() {
+  local since="" ends="" until hold
+  secure_snapshot
+  if [ "$S_SECURE" = active ]; then
+    since="$(kv_get "$SECURE" started)"; until="$(kv_get "$SECURE" until)"; hold="$(kv_get "$SECURE" hold)"
+    if [ "$hold" = 1 ]; then ends="when turned off"
+    elif [ "${until:-0}" != 0 ]; then ends="by $(fmt_end "$until"), or when all jobs finish"
+    elif [ "$(kv_get "$SECURE" seen_jobs)" = 1 ]; then ends="when all jobs finish"
+    else ends="when turned off (no job seen yet)"
+    fi
+  fi
+  if [ "${1:-}" = --porcelain ]; then
+    echo "secure=$S_SECURE"
+    echo "secure_since=${since:-}"
+    echo "secure_ends=${ends:-}"
+    echo "secure_auto=$([ "$(kv_get "$SECURE" auto)" = 1 ] && echo 1 || echo 0)"
+    echo "autoguard=$([ -f "$AUTOGUARD_OFF" ] && echo off || echo on)"
+    echo "monitor=$S_MONITOR"
+    echo "lock=$([ "$S_LOCKED" = 1 ] && echo active || echo inactive)"
+    echo "display=${S_DISPLAY:-unknown}"
+    echo "sleep_prevention=$S_SLEEP"
+    echo "sleep_detail=$S_SLEEP_DETAIL"
+    echo "session=$([ -f "$STATE" ] && echo 1 || echo 0)"
+    echo "chrome=$CHROME_STATE"
+    echo "chrome_detail=$CHROME_DETAIL"
+    echo "jobs_running=$JOBS_RUNNING"
+    echo "jobs_completed=$JOBS_COMPLETED"
+    echo "jobs_failed=$JOBS_FAILED"
+    echo "battery=$S_BATT"
+    echo "power_source=$S_POWER"
+    echo "thermal=$S_THERM"
+    echo "lid=${S_LID:-unknown}"
+    echo "displays=${S_DISPLAYS:-unknown}"
+    return 0
+  fi
+  if [ "$S_SECURE" = active ]; then
+    echo "Secure Mode:              Active since $(date -r "$since" '+%H:%M'), ends $ends$([ "$(kv_get "$SECURE" auto)" = 1 ] && echo " (started automatically, screen not locked by it)")"
+    [ "$S_MONITOR" = 1 ] || echo "                          (monitor is restarting)"
+  else
+    echo "Secure Mode:              Inactive"
+  fi
+  echo "Screen Lock:              $([ "$S_LOCKED" = 1 ] && echo Active || echo Inactive)"
+  echo "Display:                  $([ "$S_DISPLAY" = off ] && echo Off || echo On)"
+  echo "System Sleep Prevention:  $([ "$S_SLEEP" = active ] && echo Active || echo Inactive) ($S_SLEEP_DETAIL)"
+  case "$CHROME_STATE" in
+    running)     echo "Chrome Automation:        Running ($CHROME_DETAIL)" ;;
+    paused)      echo "Chrome Automation:        Paused ($CHROME_DETAIL)" ;;
+    idle)        echo "Chrome Automation:        Idle ($CHROME_DETAIL)" ;;
+    *)           echo "Chrome Automation:        Not running" ;;
+  esac
+  echo "Background Jobs:          $JOBS_RUNNING running, $JOBS_COMPLETED completed, $JOBS_FAILED failed"
+  echo "Power:                    battery ${S_BATT}% ($S_POWER), CPU speed limit ${S_THERM}%, lid ${S_LID:-?}, ${S_DISPLAYS:-?} display(s)"
+  echo "Automatic guard:          $([ -f "$AUTOGUARD_OFF" ] && echo "Off" || echo "On (keeps the Mac awake whenever a script drives Chrome)")"
+  echo
+  cmd_jobs
+  if [ -f "$SECURE_LOG" ]; then
+    echo
+    echo "Session log (last 8):"
+    tail -8 "$SECURE_LOG" | sed 's/^/  /'
+  fi
+}
+
+# ----- automatic guard -----
+#
+# The piece that works when nobody remembers to press anything. While it is
+# on, a script that drives Chrome over CDP (seen in two passes in a row) starts
+# the keep-awake half of Secure Background Mode by itself: sleep assertion,
+# lid-close protection, Wi-Fi guard and job tracking. It never locks the
+# screen; locking stays the user's action. The monitor ends the mode again
+# once the scripts have finished.
+cmd_autoguard() {
+  local prev="" d hit
+  case "${1:-run}" in
+    on)     rm -f "$AUTOGUARD_OFF"; echo "Automatic guard on: the Mac stays awake by itself whenever a script drives Chrome."; return 0 ;;
+    off)    mkdir -p "$APP_SUPPORT"; : > "$AUTOGUARD_OFF"; echo "Automatic guard off: use 'insomnia secure on' or 'insomnia on' yourself."; return 0 ;;
+    status) if [ -f "$AUTOGUARD_OFF" ]; then echo "Automatic guard: off"; else echo "Automatic guard: on"; fi; return 0 ;;
+    run)    ;;
+    *)      usage; exit 1 ;;
+  esac
+  while :; do
+    if [ ! -f "$AUTOGUARD_OFF" ] && [ ! -f "$SECURE" ] && helper_ok; then
+      chrome_scan
+      hit=0
+      for d in $CH_DRIVERS; do
+        case " $prev " in *" $d "*) hit=1 ;; esac
+      done
+      prev="$CH_DRIVERS"
+      if [ "$hit" = 1 ]; then
+        slog "automatic guard: a script is driving Chrome over CDP (pid $CH_DRIVERS), keeping the Mac awake until it finishes"
+        "$SELF" secure on --no-lock --auto >/dev/null 2>&1
+      fi
+    else
+      prev=""
+    fi
+    sleep "$AUTOGUARD_INTERVAL" &
+    wait $!
+  done
+}
+
+# insomnia doctor: what this Mac supports. Reports only; changes nothing.
+cmd_doctor() {
+  local os major arch model lockset chromev hs pct state fails=0
+  ok()   { printf '  ok    %s\n' "$*"; }
+  warn() { printf '  warn  %s\n' "$*"; }
+  bad()  { printf '  FAIL  %s\n' "$*"; fails=$(( fails + 1 )); }
+
+  echo "Hardware and macOS"
+  os="$(sw_vers -productVersion 2>/dev/null)"; major="${os%%.*}"
+  arch="$(uname -m)"; model="$(sysctl -n hw.model 2>/dev/null)"
+  if [ "${major:-0}" -ge 12 ]; then ok "macOS $os"; else bad "macOS $os is older than 12; the lock and display calls are untested there"; fi
+  case "$arch" in
+    x86_64) ok "Intel Mac ($model, $(sysctl -n machdep.cpu.brand_string 2>/dev/null))" ;;
+    arm64)  warn "Apple Silicon ($model): the same calls exist, but this build was only tested on Intel" ;;
+    *)      warn "unknown architecture $arch" ;;
+  esac
+  case "$model" in
+    MacBook*) ok "laptop with a built-in display and lid" ;;
+    *)        warn "$model is not a MacBook: there is no lid, and 'display off' applies to external displays" ;;
+  esac
+  if "$PMSET" -g batt 2>/dev/null | grep -q InternalBattery; then
+    read -r pct state <<< "$(battery_info)"
+    if [ "$state" = discharging ]; then warn "on battery (${pct}%): long sessions end at the ${BATTERY_FLOOR}% floor, so plug in the charger"
+    else ok "power: ${pct}% ($state)"; fi
+  fi
+  if [ "$(thermal_limit)" = 100 ]; then ok "no thermal throttling right now"; else warn "CPU is thermally limited to $(thermal_limit)%"; fi
+
+  echo "Keep awake"
+  if [ -x /usr/bin/caffeinate ]; then ok "caffeinate is available (sleep assertion, no password needed)"; else bad "/usr/bin/caffeinate is missing"; fi
+  if rule_installed; then ok "lid-close protection available (passwordless pmset rule installed)"
+  else warn "lid-close protection not set up: with the lid closed the Mac would sleep. Run 'insomnia setup'."; fi
+  if [ -f "$AUTOGUARD_OFF" ]; then warn "automatic guard is off: nothing keeps the Mac awake unless you start it ('insomnia autoguard on')"
+  elif launchctl print "gui/$(id -u)/com.usman.insomnia.autoguard" >/dev/null 2>&1; then ok "automatic guard is on (keeps the Mac awake whenever a script drives Chrome)"
+  else warn "automatic guard agent is not loaded; run ./install.sh"; fi
+  if launchctl print "gui/$(id -u)/$SECURE_LABEL" >/dev/null 2>&1; then ok "monitor agent is loaded (launchd restarts it if it crashes)"
+  else warn "monitor agent is not loaded; the mode still works, but without crash recovery. Run ./install.sh."; fi
+
+  echo "Lock and display"
+  if helper_ok; then
+    hs="$(helper_state)"
+    if [ -n "$(hs_get "$hs" locked)" ]; then ok "app helper works (lock state, display state and lid are readable)"
+    else bad "app helper at $HELPER did not answer; run ./install.sh"; fi
+    [ "$(hs_get "$hs" displays)" = 1 ] || warn "$(hs_get "$hs" displays) displays are connected: every one shows the lock screen, then sleeps"
+  else
+    bad "the Insomnia app is missing at $HELPER; run ./install.sh"
+  fi
+  lockset="$(sysadminctl -screenLock status 2>&1 | sed 's/.*] //')"
+  case "$lockset" in
+    *immediate*) ok "macOS asks for the password immediately after the display sleeps" ;;
+    *off*)       warn "macOS is set to never ask for a password after display sleep. Secure Background Mode still locks explicitly, but turn this on in System Settings > Lock Screen." ;;
+    *)           warn "password-after-display-sleep setting: $lockset (Secure Background Mode locks explicitly and does not depend on it)" ;;
+  esac
+
+  echo "Chrome automation"
+  if [ -d "/Applications/Google Chrome.app" ]; then
+    chromev="$(defaults read "/Applications/Google Chrome.app/Contents/Info" CFBundleShortVersionString 2>/dev/null)"
+    ok "Google Chrome $chromev"
+  else
+    warn "Google Chrome is not in /Applications"
+  fi
+  chrome_scan; chrome_status
+  case "$CHROME_STATE" in
+    running) ok "automation running: $CHROME_DETAIL" ;;
+    paused)  warn "$CHROME_DETAIL" ;;
+    *)       ok "$CHROME_DETAIL" ;;
+  esac
+  if [ "$CH_COUNT" -gt 0 ] && [ -n "$CH_PORTS" ] && [ "$CH_UNTHROTTLED" -lt "$CH_COUNT" ]; then
+    warn "$(( CH_COUNT - CH_UNTHROTTLED )) browser(s) run without --disable-backgrounding-occluded-windows; see 'Chrome behind the lock screen' in the README"
+  fi
+  [ "$CH_HEADLESS" -gt 0 ] && ok "$CH_HEADLESS headless browser(s): they need no display at all"
+
+  echo
+  if [ "$fails" = 0 ]; then echo "Secure Background Mode is supported on this Mac."; else echo "$fails problem(s) must be fixed first."; return 1; fi
+}
+
 case "${1:-status}" in
   on)        cmd_on "${2:-}" ;;
   off)       cmd_off ;;
@@ -306,6 +1136,23 @@ case "${1:-status}" in
   backstop)  cmd_backstop ;;
   netguard)  cmd_netguard ;;
   setup)     cmd_setup ;;
+  secure)
+    shift
+    case "${1:-status}" in
+      on)      shift; cmd_secure_on "$@" ;;
+      off)     cmd_secure_off ;;
+      status)  shift; cmd_secure_status "$@" ;;
+      *)       usage; exit 1 ;;
+    esac ;;
+  secure-monitor) cmd_secure_monitor ;;
+  run)         shift; cmd_run "$@" ;;
+  watch)       shift; cmd_watch "$@" ;;
+  jobs)        shift; cmd_jobs "$@" ;;
+  lock)        cmd_lock ;;
+  display-off) cmd_display_off ;;
+  doctor)      cmd_doctor ;;
+  panel)       cmd_panel ;;
+  autoguard)   shift; cmd_autoguard "$@" ;;
   -h|--help|help) usage ;;
   *)         usage; exit 1 ;;
 esac
