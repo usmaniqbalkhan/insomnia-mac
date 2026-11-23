@@ -417,6 +417,11 @@ fmt_dur() {
   fi
 }
 
+# True when the process is stopped (SIGSTOP), for example frozen by a
+# scheduler during hours when nothing may run. A frozen process does no work,
+# so it is no reason to keep the Mac awake.
+pid_frozen() { case "$(ps -o stat= -p "$1" 2>/dev/null)" in *T*) return 0 ;; esac; return 1; }
+
 helper_ok() { [ -x "$HELPER" ]; }
 # Prints locked=0|1, display=on|off, lid=open|closed, displays=N, one per line.
 helper_state() { "$HELPER" --state 2>/dev/null; }
@@ -499,13 +504,14 @@ refresh_jobs() {
   done
 }
 
-job_counts() {
+job_counts() {  # JOBS_ACTIVE = running and not frozen
   local f
-  JOBS_RUNNING=0; JOBS_COMPLETED=0; JOBS_FAILED=0
+  JOBS_RUNNING=0; JOBS_COMPLETED=0; JOBS_FAILED=0; JOBS_ACTIVE=0
   for f in "$JOBS_DIR"/*.job; do
     [ -f "$f" ] || continue
     case "$(kv_get "$f" status)" in
-      running)   JOBS_RUNNING=$(( JOBS_RUNNING + 1 )) ;;
+      running)   JOBS_RUNNING=$(( JOBS_RUNNING + 1 ))
+                 pid_frozen "$(kv_get "$f" pid)" || JOBS_ACTIVE=$(( JOBS_ACTIVE + 1 )) ;;
       completed) JOBS_COMPLETED=$(( JOBS_COMPLETED + 1 )) ;;
       failed)    JOBS_FAILED=$(( JOBS_FAILED + 1 )) ;;
     esac
@@ -641,12 +647,13 @@ chrome_scan() {
           [ "$c" = "$$" ] && continue
           ccmd="$(ps -o command= -p "$c" 2>/dev/null)"
           case "$ccmd" in ""|*"Google Chrome"*|*Chromium*|*"Microsoft Edge"*) continue ;; esac
+          pid_frozen "$c" && continue
           CH_DRIVERS="$CH_DRIVERS $c"
         done
       fi
     fi
     case "$rest" in
-      *"--remote-debugging-pipe"*) [ "$ppid" -gt 1 ] && CH_DRIVERS="$CH_DRIVERS $ppid" ;;
+      *"--remote-debugging-pipe"*) [ "$ppid" -gt 1 ] && ! pid_frozen "$ppid" && CH_DRIVERS="$CH_DRIVERS $ppid" ;;
     esac
   done < <(ps -axo pid=,ppid=,stat=,command=)
   CH_PORTS="$(printf '%s\n' $CH_PORTS | sort -un | tr '\n' ' ')"
@@ -990,7 +997,7 @@ cmd_secure_monitor() {
     adopt_drivers "$prev_drivers"
     prev_drivers="$CH_DRIVERS"
     job_counts
-    if [ "$JOBS_RUNNING" -gt 0 ]; then
+    if [ "$JOBS_ACTIVE" -gt 0 ]; then
       [ "$(kv_get "$SECURE" seen_jobs)" = 1 ] || kv_set "$SECURE" seen_jobs 1
       idle_since=0
     fi
@@ -1026,9 +1033,12 @@ cmd_secure_monitor() {
     if [ "$state" = discharging ] && [ "$pct" -le "$BATTERY_FLOOR" ]; then
       secure_release "battery ${pct}% is at or below the ${BATTERY_FLOOR}% floor" "Battery is low (${pct}%), so it stopped to protect the battery."; break
     fi
-    if [ "$hold" != 1 ] && [ "$(kv_get "$SECURE" seen_jobs)" = 1 ] && [ "$JOBS_RUNNING" = 0 ]; then
+    if [ "$hold" != 1 ] && [ "$(kv_get "$SECURE" seen_jobs)" = 1 ] && [ "$JOBS_ACTIVE" = 0 ]; then
       [ "$idle_since" = 0 ] && idle_since="$now"
       if [ $(( now - idle_since )) -ge "${grace:-$RELEASE_GRACE}" ]; then
+        if [ "$JOBS_RUNNING" -gt 0 ]; then
+          secure_release "all running jobs are frozen (SIGSTOP)" "Your automation is paused (frozen), so there is nothing to stay awake for."; break
+        fi
         secure_release "all jobs finished" "All automation has finished."; break
       fi
     fi
