@@ -42,6 +42,39 @@ your Mac password, then `insomnia on` or click the eye in the menu bar.
 - `/etc/sudoers.d/insomnia`: **you install this one with your password.** It lets your
   user run exactly `/usr/bin/pmset -a disablesleep 1` and `... 0` without a password.
 
+## The simple way: one button
+
+Click the eye in the menu bar and choose **Open Insomnia…**. Pick how long,
+press **Start**, walk away.
+
+- The Mac stays fully running for that long: browser automation, rendering,
+  API calls and uploads all continue, whether or not anything is "detected".
+- The screen is locked (the normal macOS password screen) and the display
+  turns off. The lid stays open.
+- When the time is up, normal sleep comes back by itself.
+- While it runs, the window shows only a status line and an **activity log**
+  in plain words: when it started, when the screen was locked or unlocked,
+  which automation ran, finished or failed, whether the internet dropped and
+  came back, and when it ended. **Stop and Go Back to Normal** ends it early.
+
+The same from the menu (**Keep My Mac Running For**) or the command line:
+
+```bash
+insomnia keep 6h            # 6 hours, screen locked, then normal sleep again
+insomnia keep forever       # until you stop it
+insomnia keep 6h --no-lock  # the same without locking
+insomnia restore            # stop everything, restore normal power settings
+insomnia panel              # open the window
+```
+
+Everything is local macOS power management (`caffeinate` and `pmset`). Nothing
+depends on a server or on any cloud activity. "Normal power settings" means
+exactly the two things this tool changes: `SleepDisabled` back to 0 and its
+sleep assertion released. It does not touch other apps' own keep-awake tools.
+
+The technical controls (job list, indicators, compatibility check) are under
+**More > Details…** in the menu.
+
 ## Use
 
 ```bash
@@ -173,6 +206,7 @@ What follows from that:
 ```bash
 PLAYWRIGHT_CORE=/path/to/node_modules/playwright-core tests/e2e-secure.sh   # locks the screen for ~4 minutes
 tests/lock-check.sh                                                         # locks the screen for ~15 seconds
+PLAYWRIGHT_CORE=/path/to/node_modules/playwright-core tests/keep-test.sh    # the timed button; locks the screen for 2 minutes
 PLAYWRIGHT_CORE=/path/to/node_modules/playwright-core tests/lid-closed-test.sh # start it, then close the lid for a few minutes
 ```
 

@@ -18,6 +18,7 @@ let logFile = NSString(string: "~/Library/Logs/Insomnia/insomnia.log").expanding
 let lockOnLidCloseKey = "lockOnLidClose"
 let secureFile = NSString(string: "~/Library/Application Support/Insomnia/secure").expandingTildeInPath
 let secureLogFile = NSString(string: "~/Library/Logs/Insomnia/secure.log").expandingTildeInPath
+let activityLogFile = NSString(string: "~/Library/Logs/Insomnia/activity.log").expandingTildeInPath
 
 struct CommandResult {
     let status: Int32
@@ -175,8 +176,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let endLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let toggleItem = NSMenuItem(title: "Keep Awake With Lid Closed", action: #selector(toggle), keyEquivalent: "")
     private let lockOnLidItem = NSMenuItem(title: "Lock Screen When Lid Closes", action: #selector(toggleLockOnLidClose), keyEquivalent: "")
-    private let secureToggleItem = NSMenuItem(title: "Start Secure Background Mode", action: #selector(toggleSecure), keyEquivalent: "")
+    private let stopItem = NSMenuItem(title: "Stop and Go Back to Normal", action: #selector(stopAll), keyEquivalent: "")
     private let securePanel = SecurePanel()
+    private let mainWindow = MainWindow()
     private let formatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "EEE d MMM, HH:mm"
@@ -195,7 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.toolTip = "Insomnia: keep this Mac awake with the lid closed"
+        statusItem.button?.toolTip = "Insomnia: keep this Mac running"
 
         let menu = NSMenu()
         menu.delegate = self
@@ -206,46 +208,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(endLine)
         menu.addItem(.separator())
 
-        toggleItem.target = self
-        menu.addItem(toggleItem)
+        let openItem = NSMenuItem(title: "Open Insomnia…", action: #selector(openMainWindow), keyEquivalent: "o")
+        openItem.target = self
+        menu.addItem(openItem)
 
-        let timed = NSMenu()
+        let keepMenu = NSMenu()
         let choices: [(String, String)] = [
-            ("1 Hour", "1h"), ("2 Hours", "2h"), ("4 Hours", "4h"),
-            ("8 Hours", "8h"), ("12 Hours", "12h"), ("24 Hours", "24h"),
+            ("1 Hour", "1h"), ("2 Hours", "2h"), ("4 Hours", "4h"), ("6 Hours", "6h"),
+            ("8 Hours", "8h"), ("12 Hours", "12h"), ("Until I Stop It", "forever"),
         ]
         for (title, arg) in choices {
-            let item = NSMenuItem(title: title, action: #selector(startTimed(_:)), keyEquivalent: "")
+            let item = NSMenuItem(title: title, action: #selector(keepFor(_:)), keyEquivalent: "")
             item.representedObject = arg
             item.target = self
-            timed.addItem(item)
+            keepMenu.addItem(item)
         }
-        let timedItem = NSMenuItem(title: "Keep Awake For…", action: nil, keyEquivalent: "")
-        timedItem.submenu = timed
-        menu.addItem(timedItem)
-        menu.addItem(.separator())
-
-        lockOnLidItem.target = self
-        menu.addItem(lockOnLidItem)
+        let keepItem = NSMenuItem(title: "Keep My Mac Running For (Locks the Screen)", action: nil, keyEquivalent: "")
+        keepItem.submenu = keepMenu
+        menu.addItem(keepItem)
+        stopItem.target = self
+        menu.addItem(stopItem)
         let lockNowItem = NSMenuItem(title: "Lock Screen Now", action: #selector(lockNow), keyEquivalent: "l")
         lockNowItem.target = self
         menu.addItem(lockNowItem)
         menu.addItem(.separator())
 
-        secureToggleItem.target = self
-        menu.addItem(secureToggleItem)
-        let securePanelItem = NSMenuItem(title: "Secure Background Mode…", action: #selector(openSecurePanel), keyEquivalent: "s")
-        securePanelItem.target = self
-        menu.addItem(securePanelItem)
-        menu.addItem(.separator())
-
-        let logItem = NSMenuItem(title: "Open Log", action: #selector(openLog), keyEquivalent: "")
+        // Everything technical lives one level down.
+        let more = NSMenu()
+        toggleItem.target = self
+        more.addItem(toggleItem)
+        lockOnLidItem.target = self
+        more.addItem(lockOnLidItem)
+        more.addItem(.separator())
+        let detailsItem = NSMenuItem(title: "Details…", action: #selector(openSecurePanel), keyEquivalent: "")
+        detailsItem.target = self
+        more.addItem(detailsItem)
+        let logItem = NSMenuItem(title: "Open Technical Log", action: #selector(openLog), keyEquivalent: "")
         logItem.target = self
-        menu.addItem(logItem)
+        more.addItem(logItem)
+        let moreItem = NSMenuItem(title: "More", action: nil, keyEquivalent: "")
+        moreItem.submenu = more
+        menu.addItem(moreItem)
         let quitItem = NSMenuItem(title: "Quit Insomnia", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
 
+        mainWindow.onDetails = { [weak self] in self?.securePanel.show() }
         statusItem.menu = menu
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
@@ -263,7 +271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         // `insomnia panel` asks the running app to show the control panel.
         DistributedNotificationCenter.default().addObserver(
-            self, selector: #selector(openSecurePanel),
+            self, selector: #selector(openMainWindow),
             name: Notification.Name("com.usman.insomnia.showPanel"), object: nil)
         let sources = lidWatcher.start()
         appendLog("started, lid watcher: notifications \(sources.notifications ? "on" : "FAILED"), polling \(sources.polling ? "on" : "FAILED")")
@@ -276,7 +284,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func refresh() {
         let on = sleepDisabled()
         let secure = FileManager.default.fileExists(atPath: secureFile)
-        secureToggleItem.title = secure ? "Stop Secure Background Mode" : "Start Secure Background Mode (Locks Now)"
+        let keep = KeepState.read()
+        stopItem.isHidden = !keep.running
         let symbol = secure ? "lock.shield.fill" : (on ? "eye.fill" : "eye.slash")
         let description = secure ? "Insomnia: Secure Background Mode" : (on ? "Insomnia: awake with lid closed" : "Insomnia: normal sleep")
         if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: description) {
@@ -289,16 +298,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         toggleItem.state = on ? .on : .off
         lockOnLidItem.state = lockOnLidClose ? .on : .off
-        if on {
-            statusLine.title = "Awake: lid closed, Mac keeps running"
-            if let end = sessionEnd() {
-                endLine.title = "Ends \(formatter.string(from: end))"
-            } else {
-                endLine.title = "Ends when you turn it off"
-            }
+        statusLine.title = keep.headline
+        if keep.running, let until = keep.until {
+            endLine.title = "Ends \(formatter.string(from: until))"
             endLine.isHidden = false
         } else {
-            statusLine.title = "Normal: lid closed, Mac sleeps"
             endLine.isHidden = true
         }
     }
@@ -356,8 +360,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lockScreen()
     }
 
-    @objc func toggleSecure() {
-        runCLI(FileManager.default.fileExists(atPath: secureFile) ? ["secure", "off"] : ["secure", "on"])
+    @objc func keepFor(_ sender: NSMenuItem) {
+        guard let arg = sender.representedObject as? String else { return }
+        runCLI(["keep", arg])
+    }
+
+    @objc func stopAll() {
+        runCLI(["restore"])
+    }
+
+    @objc func openMainWindow() {
+        mainWindow.show()
     }
 
     @objc func openSecurePanel() {
@@ -401,6 +414,391 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
+
+// MARK: - What is running right now (read straight from the state files)
+
+/// The few facts the simple window and the menu need. Reading two small files
+/// is cheap enough to do every few seconds.
+struct KeepState {
+    var secure = false          // Secure Background Mode is on
+    var session = false         // the lid-closed keep-awake session is on
+    var until: Date?            // when it ends by itself, if it has an end
+    var hold = false            // stays on until stopped (or until `until`)
+    var auto = false            // started by the automatic guard
+    var restore = false         // normal sleep comes back at the end
+
+    var running: Bool { secure || session }
+
+    static func read() -> KeepState {
+        var state = KeepState()
+        if let text = try? String(contentsOfFile: secureFile, encoding: .utf8) {
+            state.secure = true
+            var kv: [String: String] = [:]
+            for line in text.split(separator: "\n") {
+                guard let eq = line.firstIndex(of: "=") else { continue }
+                kv[String(line[..<eq])] = String(line[line.index(after: eq)...])
+            }
+            if let t = TimeInterval(kv["until"] ?? ""), t > 0 { state.until = Date(timeIntervalSince1970: t) }
+            state.hold = kv["hold"] == "1"
+            state.auto = kv["auto"] == "1"
+            state.restore = kv["restore"] == "1" || kv["owns_session"] == "1"
+        }
+        if FileManager.default.fileExists(atPath: stateFile) {
+            state.session = true
+            if !state.secure {
+                state.until = sessionEnd()
+                state.restore = true
+            }
+        }
+        return state
+    }
+
+    /// "5 h 42 min left", "42 min left", "less than a minute left"
+    static func remaining(until: Date) -> String {
+        let seconds = Int(until.timeIntervalSinceNow)
+        if seconds < 60 { return "less than a minute left" }
+        let hours = seconds / 3600, minutes = (seconds % 3600) / 60
+        if hours > 0 { return minutes > 0 ? "\(hours) h \(minutes) min left" : "\(hours) h left" }
+        return "\(minutes) min left"
+    }
+
+    /// One short line for the menu and the window title row.
+    var headline: String {
+        if !running { return "Normal: your Mac sleeps as usual" }
+        if let until = until { return "Staying awake · " + KeepState.remaining(until: until) }
+        if secure && auto { return "Staying awake while automation runs" }
+        if secure && !hold { return "Staying awake until your automation finishes" }
+        return "Staying awake until you stop it"
+    }
+}
+
+// MARK: - The simple window
+
+/// One window, two faces. Idle: pick a duration and press Start. Running:
+/// only the status line and the activity log. All technical detail lives in
+/// the separate Details window.
+final class MainWindow: NSObject, NSWindowDelegate {
+    var onDetails: (() -> Void)?
+
+    private var window: NSWindow?
+    private var dataTimer: Timer?
+    private var state = KeepState()
+    private var wantsLog = false          // the user opened the log while nothing is running
+    private var lastLogText = ""
+    private var busy = false
+
+    private let idleView = NSStackView()
+    private let logPane = NSStackView()
+    private let durationPopup = NSPopUpButton()
+    private let lockCheck = NSButton(checkboxWithTitle: "Lock the screen now (your password is needed to get back in)", target: nil, action: nil)
+    private let restoreCheck = NSButton(checkboxWithTitle: "Go back to normal sleep when the time is up", target: nil, action: nil)
+    private let startButton = NSButton(title: "Start", target: nil, action: nil)
+    private let powerNote = NSTextField(labelWithString: "")
+    private let statusDot = NSTextField(labelWithString: "●")
+    private let statusTitle = NSTextField(labelWithString: "")
+    private let statusDetail = NSTextField(wrappingLabelWithString: "")
+    private let stopButton = NSButton(title: "Stop and Go Back to Normal", target: nil, action: nil)
+    private let lockButton = NSButton(title: "Lock Screen", target: nil, action: nil)
+    private let backButton = NSButton(title: "Back", target: nil, action: nil)
+    private let logView = NSTextView()
+
+    private static let durations: [(title: String, arg: String)] = [
+        ("30 minutes", "30m"), ("1 hour", "1h"), ("2 hours", "2h"), ("4 hours", "4h"),
+        ("6 hours", "6h"), ("8 hours", "8h"), ("12 hours", "12h"), ("24 hours", "24h"),
+        ("Until I stop it", "forever"),
+    ]
+
+    func show() {
+        if window == nil { build() }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+        refresh()
+        dataTimer?.invalidate()
+        dataTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        dataTimer?.invalidate()
+        dataTimer = nil
+        wantsLog = false
+    }
+
+    private func pushButton(_ b: NSButton, _ action: Selector) {
+        b.target = self
+        b.action = action
+        b.bezelStyle = .rounded
+    }
+
+    private func build() {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 560),
+                         styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                         backing: .buffered, defer: false)
+        w.title = "Insomnia"
+        w.isReleasedWhenClosed = false
+        w.delegate = self
+        w.minSize = NSSize(width: 480, height: 460)
+
+        // ----- idle face -----
+        let icon = NSImageView()
+        if let image = NSImage(systemSymbolName: "eye.fill", accessibilityDescription: nil) {
+            icon.image = image.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 40, weight: .regular))
+        }
+        icon.contentTintColor = .controlAccentColor
+        let title = NSTextField(labelWithString: "Keep my Mac running")
+        title.font = .systemFont(ofSize: 24, weight: .bold)
+        let blurb = NSTextField(wrappingLabelWithString:
+            "Your Mac stays fully awake and keeps working: browser automation, video rendering, uploads, everything. "
+            + "Nothing is paused or closed. Only the screen is locked, for privacy.")
+        blurb.textColor = .secondaryLabelColor
+        blurb.alignment = .center
+
+        let howLong = NSTextField(labelWithString: "For how long?")
+        howLong.font = .systemFont(ofSize: 14, weight: .medium)
+        durationPopup.addItems(withTitles: Self.durations.map { $0.title })
+        let saved = UserDefaults.standard.string(forKey: "keepDuration") ?? "6h"
+        durationPopup.selectItem(at: Self.durations.firstIndex { $0.arg == saved } ?? 4)
+        durationPopup.target = self
+        durationPopup.action = #selector(durationChanged)
+        durationPopup.font = .systemFont(ofSize: 14)
+        let durationRow = NSStackView(views: [howLong, durationPopup])
+        durationRow.spacing = 10
+
+        lockCheck.state = UserDefaults.standard.object(forKey: "keepLock") == nil || UserDefaults.standard.bool(forKey: "keepLock") ? .on : .off
+        restoreCheck.state = UserDefaults.standard.object(forKey: "keepRestore") == nil || UserDefaults.standard.bool(forKey: "keepRestore") ? .on : .off
+        let options = NSStackView(views: [lockCheck, restoreCheck])
+        options.orientation = .vertical
+        options.alignment = .leading
+        options.spacing = 8
+
+        pushButton(startButton, #selector(start))
+        startButton.controlSize = .large
+        startButton.font = .systemFont(ofSize: 16, weight: .semibold)
+        startButton.bezelColor = .controlAccentColor
+        startButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 200).isActive = true
+
+        powerNote.textColor = .secondaryLabelColor
+        powerNote.font = .systemFont(ofSize: 12)
+
+        let logLink = NSButton(title: "Activity Log", target: self, action: #selector(showLog))
+        logLink.bezelStyle = .rounded
+        let detailsLink = NSButton(title: "Details…", target: self, action: #selector(details))
+        detailsLink.bezelStyle = .rounded
+        let links = NSStackView(views: [logLink, detailsLink])
+        links.spacing = 10
+
+        let spacer1 = NSView(), spacer2 = NSView()
+        for v in [icon, title, blurb, durationRow, options, startButton, powerNote, spacer1, links] { idleView.addArrangedSubview(v) }
+        idleView.orientation = .vertical
+        idleView.alignment = .centerX
+        idleView.spacing = 14
+        idleView.setCustomSpacing(6, after: icon)
+        idleView.setCustomSpacing(22, after: blurb)
+        idleView.setCustomSpacing(18, after: durationRow)
+        idleView.setCustomSpacing(24, after: options)
+        idleView.edgeInsets = NSEdgeInsets(top: 28, left: 32, bottom: 20, right: 32)
+        _ = spacer2
+
+        // ----- running face: status line + log, nothing else -----
+        statusDot.font = .systemFont(ofSize: 16)
+        statusTitle.font = .systemFont(ofSize: 17, weight: .semibold)
+        statusTitle.lineBreakMode = .byTruncatingTail
+        statusDetail.textColor = .secondaryLabelColor
+        statusDetail.font = .systemFont(ofSize: 12)
+        let titleRow = NSStackView(views: [statusDot, statusTitle])
+        titleRow.spacing = 6
+        pushButton(stopButton, #selector(stop))
+        pushButton(lockButton, #selector(lockNow))
+        pushButton(backButton, #selector(hideLog))
+        let buttons = NSStackView(views: [stopButton, lockButton, backButton])
+        buttons.spacing = 10
+
+        logView.isEditable = false
+        logView.font = .systemFont(ofSize: 13)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.tabStops = [NSTextTab(textAlignment: .left, location: 78)]
+        paragraph.headIndent = 78
+        paragraph.paragraphSpacing = 3
+        logView.defaultParagraphStyle = paragraph
+        logView.textContainerInset = NSSize(width: 8, height: 8)
+        logView.autoresizingMask = [.width]
+        logView.isVerticallyResizable = true
+        let scroll = NSScrollView()
+        scroll.documentView = logView
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+
+        for v in [titleRow, statusDetail, buttons, scroll] as [NSView] { logPane.addArrangedSubview(v) }
+        logPane.orientation = .vertical
+        logPane.alignment = .leading
+        logPane.spacing = 10
+        logPane.setCustomSpacing(4, after: titleRow)
+        logPane.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
+
+        let content = NSView()
+        for pane in [idleView, logPane] {
+            pane.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(pane)
+            NSLayoutConstraint.activate([
+                pane.topAnchor.constraint(equalTo: content.topAnchor),
+                pane.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+                pane.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+                pane.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            ])
+        }
+        NSLayoutConstraint.activate([
+            blurb.widthAnchor.constraint(lessThanOrEqualToConstant: 420),
+            scroll.widthAnchor.constraint(equalTo: logPane.widthAnchor, constant: -36),
+            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 240),
+            statusDetail.widthAnchor.constraint(lessThanOrEqualTo: logPane.widthAnchor, constant: -36),
+        ])
+        w.contentView = content
+        w.center()
+        window = w
+    }
+
+    // ----- data -----
+
+    private func batteryLine() -> (text: String, warn: Bool) {
+        let out = run("/usr/bin/pmset", ["-g", "batt"]).output
+        var percent = ""
+        if let r = out.range(of: #"\d{1,3}%"#, options: .regularExpression) { percent = String(out[r]) }
+        if out.contains("'AC Power'") { return ("On the charger, battery \(percent). Good for a long run.", false) }
+        return ("On battery (\(percent)). Plug in the charger for a long run: it stops by itself at 10%.", true)
+    }
+
+    private func logText() -> String {
+        guard let text = try? String(contentsOfFile: activityLogFile, encoding: .utf8), !text.isEmpty else {
+            return "Nothing has happened yet. When you press Start, each step shows up here."
+        }
+        let dayIn = DateFormatter(); dayIn.dateFormat = "yyyy-MM-dd"
+        let timeIn = DateFormatter(); timeIn.dateFormat = "HH:mm"
+        let timeOut = DateFormatter(); timeOut.dateFormat = "h:mm a"
+        let dayOut = DateFormatter(); dayOut.dateFormat = "EEEE d MMMM"
+        var lines: [String] = []
+        var lastDay = ""
+        for raw in text.split(separator: "\n").suffix(400) {
+            let line = String(raw)
+            guard line.count > 20, line[line.index(line.startIndex, offsetBy: 4)] == "-" else { continue }
+            let day = String(line.prefix(10))
+            var time = String(line.dropFirst(11).prefix(5))
+            if let t = timeIn.date(from: time) { time = timeOut.string(from: t) }
+            let message = String(line.dropFirst(20))
+            if day != lastDay {
+                if let d = dayIn.date(from: day) { lines.append((lines.isEmpty ? "" : "\n") + dayOut.string(from: d)) }
+                lastDay = day
+            }
+            lines.append("\(time)\t\(message)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    @objc func refresh() {
+        if busy { return }
+        busy = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let state = KeepState.read()
+            let battery = self.batteryLine()
+            let log = self.logText()
+            DispatchQueue.main.async {
+                self.busy = false
+                self.state = state
+                self.apply(battery: battery, log: log)
+            }
+        }
+    }
+
+    private func apply(battery: (text: String, warn: Bool), log: String) {
+        let showLogPane = state.running || wantsLog
+        idleView.isHidden = showLogPane
+        logPane.isHidden = !showLogPane
+
+        powerNote.stringValue = battery.text
+        powerNote.textColor = battery.warn ? .systemOrange : .secondaryLabelColor
+        restoreCheck.isEnabled = Self.durations[max(0, durationPopup.indexOfSelectedItem)].arg != "forever"
+
+        if state.running {
+            statusDot.textColor = .systemGreen
+            statusTitle.stringValue = state.headline
+            var parts: [String] = []
+            if let until = state.until {
+                let f = DateFormatter()
+                f.dateFormat = Calendar.current.isDateInToday(until) ? "'today at' h:mm a" : "EEE 'at' h:mm a"
+                parts.append("Ends \(f.string(from: until)).")
+                parts.append(state.restore ? "Normal sleep comes back by itself." : "The lid-closed keep-awake stays on afterwards.")
+            } else if state.secure && state.auto {
+                parts.append("Started by itself because a script is driving Chrome. It stops 2 minutes after the script finishes.")
+            } else if state.secure && !state.hold {
+                parts.append("It stops 2 minutes after your automation finishes.")
+            } else {
+                parts.append("It stays on until you press Stop.")
+            }
+            parts.append(battery.warn ? battery.text : "Everything keeps working, also with the screen locked.")
+            statusDetail.stringValue = parts.joined(separator: " ")
+            statusDetail.textColor = battery.warn ? .systemOrange : .secondaryLabelColor
+            stopButton.isHidden = false
+            lockButton.isHidden = false
+            backButton.isHidden = true
+        } else {
+            statusDot.textColor = .tertiaryLabelColor
+            statusTitle.stringValue = "Nothing is running"
+            statusDetail.stringValue = "Your Mac sleeps as usual. This is what happened earlier."
+            statusDetail.textColor = .secondaryLabelColor
+            stopButton.isHidden = true
+            lockButton.isHidden = true
+            backButton.isHidden = false
+        }
+
+        if log != lastLogText {
+            lastLogText = log
+            logView.string = log
+            logView.scrollToEndOfDocument(nil)
+        }
+    }
+
+    // ----- actions -----
+
+    private func command(_ arguments: [String]) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = run(cli, arguments)
+            DispatchQueue.main.async {
+                self.refresh()
+                if result.status != 0 {
+                    let alert = NSAlert()
+                    alert.messageText = "That did not fully work"
+                    alert.informativeText = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                    alert.alertStyle = .warning
+                    alert.addButton(withTitle: "OK")
+                    NSApp.activate(ignoringOtherApps: true)
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
+    @objc func durationChanged() {
+        let choice = Self.durations[max(0, durationPopup.indexOfSelectedItem)].arg
+        UserDefaults.standard.set(choice, forKey: "keepDuration")
+        restoreCheck.isEnabled = choice != "forever"
+    }
+
+    @objc func start() {
+        let choice = Self.durations[max(0, durationPopup.indexOfSelectedItem)].arg
+        UserDefaults.standard.set(choice, forKey: "keepDuration")
+        UserDefaults.standard.set(lockCheck.state == .on, forKey: "keepLock")
+        UserDefaults.standard.set(restoreCheck.state == .on, forKey: "keepRestore")
+        var arguments = ["keep", choice]
+        if lockCheck.state != .on { arguments.append("--no-lock") }
+        if restoreCheck.state != .on { arguments.append("--no-restore") }
+        command(arguments)
+    }
+
+    @objc func stop() { wantsLog = false; command(["restore"]) }
+    @objc func lockNow() { command(["display-off"]) }
+    @objc func showLog() { wantsLog = true; refresh() }
+    @objc func hideLog() { wantsLog = false; refresh() }
+    @objc func details() { onDetails?() }
+}
 
 // MARK: - Secure Background Mode control panel
 
@@ -453,7 +851,7 @@ final class SecurePanel: NSObject, NSWindowDelegate {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 640),
                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
                          backing: .buffered, defer: false)
-        w.title = "Secure Background Mode"
+        w.title = "Insomnia Details"
         w.isReleasedWhenClosed = false
         w.delegate = self
         w.minSize = NSSize(width: 560, height: 520)

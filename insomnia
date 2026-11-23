@@ -6,6 +6,13 @@
 # krishhgg/Insomnia and Vorssaint use. Only this tool resets the bit
 # (`insomnia off`, a timer, or the battery floor); macOS never does.
 #
+# The simple way:
+#   insomnia keep 6h       keep the Mac fully running for 6 hours with the screen
+#                          locked, then go back to normal sleep (30m, 2h, 1d,
+#                          or `forever` until you stop it; --no-lock, --no-restore)
+#   insomnia restore       stop everything and restore normal power settings
+#   insomnia panel         open the window (duration picker, Start, activity log)
+#
 #   insomnia on            keep awake until `insomnia off`
 #   insomnia on 8h         keep awake for 8 hours (30m, 2h, 1d also work)
 #   insomnia off           back to normal sleep
@@ -28,7 +35,6 @@
 #   insomnia jobs [clear]  list jobs (clear forgets finished ones)
 #   insomnia lock          lock the screen now
 #   insomnia display-off   lock, then turn the display off
-#   insomnia panel         open the control panel window
 #   insomnia doctor        hardware, macOS and Chrome compatibility check
 #   insomnia autoguard on|off|status   keep the Mac awake by itself whenever a
 #                          script is driving Chrome (on by default)
@@ -71,10 +77,14 @@ AUTOGUARD_INTERVAL=20                                # seconds between automatic
 RELEASE_GRACE="${INSOMNIA_RELEASE_GRACE:-120}"       # seconds with no running job before auto-release
 
 log() { mkdir -p "$LOG_DIR"; printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+# The activity log is the plain-language one the window shows: what happened,
+# in words anyone can read. The other logs keep the technical detail.
+ACTIVITY_LOG="$LOG_DIR/activity.log"
+alog() { mkdir -p "$LOG_DIR"; printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$ACTIVITY_LOG"; }
 die() { echo "insomnia: $*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # Prints 1 when system sleep is disabled, else 0.
@@ -133,6 +143,7 @@ parse_duration() {
 }
 
 fmt_end() { date -r "$1" '+%a %d %b, %H:%M'; }
+fmt_plain() { date -r "$1" '+%A at %-I:%M %p'; }   # for the activity log: "Monday at 5:42 PM"
 
 # Prints "<percent> ac|charging|discharging"
 battery_info() {
@@ -303,6 +314,7 @@ cmd_netguard() {
     if probe; then
       if [ "$declared_down" = 1 ]; then
         nlog "network BACK after $(( now - first_fail ))s, Wi-Fi restarts: $repairs ($(wifi_state))"
+        alog "Internet is back after $(( now - first_fail )) seconds."
       fi
       first_fail=0; declared_down=0; repairs=0
     else
@@ -311,6 +323,7 @@ cmd_netguard() {
       if [ "$declared_down" = 0 ] && [ "$down_for" -ge "$NET_DOWN_AFTER" ]; then
         declared_down=1
         nlog "network DOWN for ${down_for}s ($(wifi_state))"
+        alog "Internet connection lost. Reconnecting Wi-Fi by itself."
       fi
       if [ "$down_for" -ge "$NET_REPAIR_AFTER" ]; then
         wait=60
@@ -434,6 +447,22 @@ job_create() {  # id name kind pid cmd -> prints the job file
   echo "$f"
 }
 
+# A short name for the activity log: the given name, or for an adopted
+# process the script it runs ("upload.js" rather than the whole command line).
+job_label() {  # job file
+  local name cmd w
+  name="$(kv_get "$1" name)"
+  case "$name" in
+    auto:*)
+      cmd="$(kv_get "$1" cmd)"
+      for w in $cmd; do
+        case "$w" in *.js|*.mjs|*.py|*.sh|*.ts) basename "$w"; return ;; esac
+      done
+      set -- $cmd; echo "$(basename "${1:-script}")" ;;
+    *) echo "$name" ;;
+  esac
+}
+
 # Settles jobs whose process has gone. A `run` job normally records its own
 # result; this only steps in when its wrapper died first.
 refresh_jobs() {
@@ -458,12 +487,14 @@ refresh_jobs() {
       kv_set "$f" note "wrapper died before it could record an exit code"
       kv_set "$f" status failed
       slog "job $(kv_get "$f" id) '$(kv_get "$f" name)' FAILED: wrapper died before recording an exit code"
+      alog "Failed: $(job_label "$f") (it stopped unexpectedly)."
     else
       pid_alive "$pid" "$ps" && continue
       kv_set "$f" exit unknown
       kv_set "$f" ended "$now"
       kv_set "$f" status completed
       slog "job $(kv_get "$f" id) '$(kv_get "$f" name)' finished (watched process exited; its exit code is not available)"
+      alog "Finished: $(job_label "$f")."
     fi
   done
 }
@@ -516,6 +547,7 @@ cmd_run() {
   kv_set "$f" pid "$child"
   kv_set "$f" pid_start "$(pid_start "$child")"
   slog "job $id '$name' started (pid $child)"
+  alog "Started: $name."
   trap 'kill -TERM "$child" 2>/dev/null' TERM INT
   wait "$child"; rc=$?
   while kill -0 "$child" 2>/dev/null; do wait "$child"; rc=$?; done
@@ -524,9 +556,11 @@ cmd_run() {
   if [ "$rc" = 0 ]; then
     kv_set "$f" status completed
     slog "job $id '$name' completed (exit 0)"
+    alog "Finished: $name."
   else
     kv_set "$f" status failed
     slog "job $id '$name' FAILED (exit $rc), log: $joblog"
+    alog "Failed: $name (error code $rc)."
   fi
   exit "$rc"
 }
@@ -653,7 +687,8 @@ adopt_drivers() {  # $1 = drivers seen in the previous pass
     cmd="$(ps -o command= -p "$d" 2>/dev/null)"
     [ -n "$cmd" ] || continue
     id="$(date +%Y%m%d-%H%M%S)-$d"
-    job_create "$id" "auto: $(printf '%s' "$cmd" | cut -c1-60)" watch "$d" "$cmd" >/dev/null
+    f="$(job_create "$id" "auto: $(printf '%s' "$cmd" | cut -c1-60)" watch "$d" "$cmd")"
+    alog "Browser automation running: $(job_label "$f")."
     slog "adopted pid $d as job $id because it drives Chrome over CDP: $(printf '%s' "$cmd" | cut -c1-120)"
   done
 }
@@ -696,6 +731,51 @@ cmd_display_off() {
   if display_off; then echo "Screen locked and display off."; else die "macOS did not turn the display off (something may be holding it on, such as a playing video). The screen is locked."; fi
 }
 
+# insomnia keep <duration|forever> [--no-lock] [--no-restore]
+# The one-button version: stay fully running for a set time with the screen
+# locked, whatever is or is not running, then put the power settings back.
+# Everything is local macOS power management (caffeinate + pmset); nothing
+# here talks to any server.
+cmd_keep() {
+  local dur="" lock=1 restore=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-lock)     lock=0; shift ;;
+      --no-restore)  restore=0; shift ;;
+      *)             dur="$1"; shift ;;
+    esac
+  done
+  [ -n "$dur" ] || die "usage: insomnia keep <30m|6h|1d|forever> [--no-lock] [--no-restore]"
+  set --
+  case "$dur" in
+    forever|until-stopped) set -- --hold ;;
+    *) parse_duration "$dur" >/dev/null || die "bad duration '$dur' (try 30m, 6h, 1d or forever)"
+       set -- "$dur" --hold
+       [ "$restore" = 1 ] && set -- "$@" --restore ;;
+  esac
+  [ "$lock" = 1 ] || set -- "$@" --no-lock
+  cmd_secure_on "$@"
+}
+
+# insomnia restore: stop everything this tool does and put the normal power
+# settings back. Never unlocks the screen and never touches a running job.
+cmd_restore() {
+  local did=0
+  if [ -f "$SECURE" ]; then cmd_secure_off >/dev/null; did=1; fi
+  if [ -f "$STATE" ] || [ "$(sleep_disabled)" = 1 ]; then
+    ( cmd_off quiet ) || die "could not restore sleep; run 'insomnia status'"
+    alog "Normal sleep is back on."
+    did=1
+  fi
+  if [ "$(sleep_disabled)" = 1 ]; then die "macOS still reports sleep as disabled; run 'insomnia status'"; fi
+  if [ "$did" = 1 ]; then
+    echo "Normal power settings are restored: the Mac sleeps as usual again."
+  else
+    echo "Nothing to restore: the power settings are already normal."
+  fi
+  echo "(Sleep is enabled, and Insomnia holds no keep-awake assertion. Your jobs and the screen lock were not touched.)"
+}
+
 cmd_panel() {
   need_helper
   if ! pgrep -x Insomnia >/dev/null; then
@@ -722,25 +802,33 @@ start_monitor() {
   fi
 }
 
-secure_release() {  # $1 = reason. Ends the mode; never touches the lock, Chrome or any job.
-  local owns
-  owns="$(kv_get "$SECURE" owns_session)"
+secure_release() {  # $1 = reason, $2 = the same in plain words. Ends the mode; never touches the lock, Chrome or any job.
+  local owns restore
+  owns="$(kv_get "$SECURE" owns_session)"; restore="$(kv_get "$SECURE" restore)"
   job_counts
   slog "Secure Background Mode OFF: $1 (jobs: $JOBS_RUNNING running, $JOBS_COMPLETED completed, $JOBS_FAILED failed)"
   rm -f "$SECURE"
-  if [ "$owns" = 1 ] && [ -f "$STATE" ]; then
+  # Normal power settings come back when this mode switched sleep off itself,
+  # or when the user asked for them to be restored at the end.
+  if { [ "$owns" = 1 ] || [ "$restore" = 1 ]; } && [ -f "$STATE" ]; then
     if ( cmd_off quiet ) 2>/dev/null; then slog "lid-close protection off, normal sleep restored"; fi
+  fi
+  if [ "$(sleep_disabled)" = 1 ]; then
+    alog "${2:-Stopped.} The lid-closed keep-awake you turned on separately is still on."
+  else
+    alog "${2:-Stopped.} Normal sleep is back on."
   fi
 }
 
 # insomnia secure on [duration] [--hold] [--grace SECONDS] [--no-lock] [--no-display-off]
 cmd_secure_on() {
   local dur="" hold=0 grace="$RELEASE_GRACE" do_lock=1 do_display=1 secs until=0 owns=0 i rc=0 lockok=0
-  local auto=0 grace_given=0
+  local auto=0 grace_given=0 restore=0 plan
   while [ $# -gt 0 ]; do
     case "$1" in
       --hold)            hold=1; shift ;;
       --auto)            auto=1; shift ;;
+      --restore)         restore=1; shift ;;
       --grace)           grace="${2:-}"; grace_given=1; shift 2 ;;
       --no-lock)         do_lock=0; do_display=0; shift ;;
       --no-display-off)  do_display=0; shift ;;
@@ -763,7 +851,12 @@ cmd_secure_on() {
     [ "$hold" = 1 ] && kv_set "$SECURE" hold 1
     [ "$grace_given" = 1 ] && kv_set "$SECURE" grace "$grace"
     [ "$until" != 0 ] && kv_set "$SECURE" until "$until"
-    [ "$auto" = 1 ] || kv_set "$SECURE" auto 0
+    [ "$restore" = 1 ] && kv_set "$SECURE" restore 1
+    if [ "$auto" != 1 ]; then
+      kv_set "$SECURE" auto 0
+      if [ "$until" != 0 ]; then alog "Your Mac now stays awake until $(fmt_plain "$until")."
+      elif [ "$hold" = 1 ]; then alog "Your Mac now stays awake until you stop it."; fi
+    fi
   else
     if [ ! -f "$STATE" ]; then
       if rule_installed && set_bit 1 2>/dev/null; then
@@ -779,6 +872,13 @@ cmd_secure_on() {
     kv_set "$SECURE" until "$until"
     kv_set "$SECURE" seen_jobs 0
     kv_set "$SECURE" auto "$auto"
+    kv_set "$SECURE" restore "$restore"
+    if [ "$auto" = 1 ]; then plan="Browser automation detected. Keeping your Mac awake until it finishes."
+    elif [ "$until" != 0 ]; then plan="Started. Your Mac stays awake until $(fmt_plain "$until")."
+    elif [ "$hold" = 1 ]; then plan="Started. Your Mac stays awake until you stop it."
+    else plan="Started. Your Mac stays awake until your automation finishes."
+    fi
+    alog "$plan"
     slog "Secure Background Mode ON (hold=$hold, grace=${grace}s, until=$until, lid-close protection=$owns, started by $([ "$auto" = 1 ] && echo the automatic guard || echo the user))"
     start_monitor
   fi
@@ -796,6 +896,7 @@ cmd_secure_on() {
     fi
   else
     echo "  keep awake    FAIL  the monitor did not start; run 'insomnia doctor'"
+    alog "Problem: keep-awake could not be confirmed. Open Details and run the compatibility check."
     slog "keep awake could not be confirmed"
     rc=4
   fi
@@ -805,10 +906,12 @@ cmd_secure_on() {
     if secure_lock; then
       lockok=1
       echo "  screen lock   ok    locked, password required"
+      alog "Screen locked. Everything keeps running behind it."
     else
       echo "  screen lock   FAIL  macOS did not report the screen as locked"
       echo "                      Recovery: press Control-Command-Q, then run 'insomnia display-off'."
       slog "screen lock could not be confirmed; display left on"
+      alog "The screen could not be locked. Lock it yourself with Control-Command-Q."
       [ "$rc" = 0 ] && rc=3
     fi
     if [ "$do_display" = 1 ]; then
@@ -850,7 +953,7 @@ cmd_secure_off() {
   fi
   mp="$(kv_get "$SECURE_RUN" monitor_pid)"; mps="$(kv_get "$SECURE_RUN" monitor_start)"
   cp="$(kv_get "$SECURE_RUN" caffeinate_pid)"
-  secure_release "turned off by the user"
+  secure_release "turned off by the user" "Stopped by you."
   if pid_alive "$mp" "$mps"; then kill -TERM "$mp" 2>/dev/null; fi
   if [ -n "$cp" ] && ps -o command= -p "$cp" 2>/dev/null | grep -q caffeinate; then kill "$cp" 2>/dev/null; fi
   rm -f "$SECURE_RUN"
@@ -894,7 +997,8 @@ cmd_secure_monitor() {
 
     hs="$(helper_state)"; lock="$(hs_get "$hs" locked)"; disp="$(hs_get "$hs" display)"
     if [ -n "$lock" ] && [ "$lock" != "$last_lock" ]; then
-      if [ "$lock" = 1 ]; then slog "screen is locked"; elif [ -n "$last_lock" ]; then slog "screen unlocked (the user authenticated)"; fi
+      if [ "$lock" = 1 ]; then slog "screen is locked"
+      elif [ -n "$last_lock" ]; then slog "screen unlocked (the user authenticated)"; alog "Screen unlocked with your password."; fi
       last_lock="$lock"
     fi
     if [ -n "$disp" ] && [ "$disp" != "$last_disp" ]; then
@@ -905,6 +1009,8 @@ cmd_secure_monitor() {
     therm="$(thermal_limit)"
     if [ "$therm" != "$last_therm" ]; then
       slog "thermal: CPU speed limit ${therm}% (was ${last_therm}%)"
+      if [ "$therm" -lt 100 ] 2>/dev/null; then alog "Your Mac is hot and has slowed itself to ${therm}% speed. Work continues."
+      else alog "Temperature is back to normal."; fi
       last_therm="$therm"
     fi
     read -r pct state <<< "$(battery_info)"
@@ -915,15 +1021,15 @@ cmd_secure_monitor() {
 
     until="$(kv_get "$SECURE" until)"; hold="$(kv_get "$SECURE" hold)"; grace="$(kv_get "$SECURE" grace)"
     if [ "${until:-0}" != 0 ] && [ "$now" -ge "$until" ]; then
-      secure_release "timer ended"; break
+      secure_release "timer ended" "Time is up."; break
     fi
     if [ "$state" = discharging ] && [ "$pct" -le "$BATTERY_FLOOR" ]; then
-      secure_release "battery ${pct}% is at or below the ${BATTERY_FLOOR}% floor"; break
+      secure_release "battery ${pct}% is at or below the ${BATTERY_FLOOR}% floor" "Battery is low (${pct}%), so it stopped to protect the battery."; break
     fi
     if [ "$hold" != 1 ] && [ "$(kv_get "$SECURE" seen_jobs)" = 1 ] && [ "$JOBS_RUNNING" = 0 ]; then
       [ "$idle_since" = 0 ] && idle_since="$now"
       if [ $(( now - idle_since )) -ge "${grace:-$RELEASE_GRACE}" ]; then
-        secure_release "all jobs finished"; break
+        secure_release "all jobs finished" "All automation has finished."; break
       fi
     fi
 
@@ -971,6 +1077,10 @@ cmd_secure_status() {
     echo "secure_since=${since:-}"
     echo "secure_ends=${ends:-}"
     echo "secure_auto=$([ "$(kv_get "$SECURE" auto)" = 1 ] && echo 1 || echo 0)"
+    echo "until=$(kv_get "$SECURE" until)"
+    echo "hold=$(kv_get "$SECURE" hold)"
+    echo "restore=$(kv_get "$SECURE" restore)"
+    echo "session_end=$(cat "$STATE" 2>/dev/null)"
     echo "autoguard=$([ -f "$AUTOGUARD_OFF" ] && echo off || echo on)"
     echo "monitor=$S_MONITOR"
     echo "lock=$([ "$S_LOCKED" = 1 ] && echo active || echo inactive)"
@@ -1152,6 +1262,8 @@ case "${1:-status}" in
   display-off) cmd_display_off ;;
   doctor)      cmd_doctor ;;
   panel)       cmd_panel ;;
+  keep)        shift; cmd_keep "$@" ;;
+  restore)     cmd_restore ;;
   autoguard)   shift; cmd_autoguard "$@" ;;
   -h|--help|help) usage ;;
   *)         usage; exit 1 ;;
